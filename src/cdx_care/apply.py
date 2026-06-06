@@ -3,22 +3,33 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 from cdx_care import VERSION
-from cdx_care.db_apply import apply_db_actions, group_db_actions, preflight_db_actions
+from cdx_care.db_apply import apply_db_actions, group_db_actions, preflight_db_actions, verify_db_stat, verify_schema
 from cdx_care.doctor import load_state_thread_ids_checked
 from cdx_care.errors import CdxCareError
 from cdx_care.filesystem import ensure_private_dir
-from cdx_care.git_tools import git_hygiene_preflight, git_rm_cached
+from cdx_care.git_tools import git_hygiene_preflight, git_untrack_and_commit
+from cdx_care.logs_compact import compact_logs_db, preflight_logs_compaction
 from cdx_care.paths import StorePaths
-from cdx_care.policy import ApplyContext, admitted_db_paths, validate_action_targets
+from cdx_care.policy import DS_STORE_PATHS, ApplyContext, admitted_db_paths, validate_action_targets
 from cdx_care.policy_checks import string_list
 from cdx_care.processes import lsof_handles
 from cdx_care.receipts import failure_receipt, path_present, post_apply_next_commands, write_receipt_file
-from cdx_care.sqlite_tools import copy_db_family, file_sha256
+from cdx_care.session_repair import (
+    desired_session_index_bytes,
+    file_stat,
+    sha256_bytes,
+    verify_file_stat,
+    verify_session_file_alignment,
+    verify_state_source,
+)
+from cdx_care.sqlite_tools import connect_readonly, copy_db_family, copy_private_file, file_sha256
 from cdx_care.support_paths import preflight_managed_artifact_path, preflight_support_paths
 from cdx_care.timeutil import epoch_ms, epoch_seconds, iso_now
 from cdx_care.types import JsonObject, JsonValue, require_json_object, require_json_object_list
@@ -37,6 +48,7 @@ def apply_plan(stores: StorePaths, plan: JsonObject) -> JsonObject:
     """Apply a plan after safety gates."""
     validate_plan_header(plan, stores)
     actions = as_action_list(plan.get("planned_actions"))
+    validate_plan_policy(plan, actions)
     validate_action_targets(stores, actions)
     db_paths = admitted_db_paths(stores, actions)
     preflight_support_paths(stores, db_paths, actions)
@@ -57,6 +69,8 @@ def apply_plan(stores: StorePaths, plan: JsonObject) -> JsonObject:
     db_groups = group_db_actions(actions)
     for db_path, db_actions in db_groups.items():
         preflight_db_actions(db_path, db_actions, context)
+    compact_preflights = preflight_compact_actions(stores, actions)
+    file_preflights = preflight_jsonl_actions(stores, actions)
     git_preflights = preflight_git_actions(actions)
     ensure_private_dir(receipt_root)
     backups: list[JsonObject] = []
@@ -64,14 +78,23 @@ def apply_plan(stores: StorePaths, plan: JsonObject) -> JsonObject:
     mutation_started = False
     try:
         backups = backup_dbs(db_paths, backup_root)
+        backups.extend(backup_jsonl_targets(actions, backup_root))
         for db_path, db_actions in db_groups.items():
             db_applied = apply_db_actions(db_path, db_actions, context)
             applied.extend(db_applied)
             mutation_started = mutation_started or bool(db_applied)
         for action in actions:
-            if action.get("type") == "git_rm_cached":
-                applied.append(apply_git_action(action))
+            if action.get("type") == "sqlite_compact":
                 mutation_started = True
+                applied.append(apply_compact_action(stores, action))
+        for action in actions:
+            if action.get("type") == "jsonl_rewrite":
+                mutation_started = True
+                applied.append(apply_jsonl_action(stores, action, backup_root))
+        for action in actions:
+            if action.get("type") == "git_rm_cached":
+                mutation_started = True
+                applied.append(apply_git_action(action))
     except (CdxCareError, OSError, sqlite3.Error) as error:
         if not backups:
             backups = discover_backup_files(backup_root)
@@ -101,6 +124,8 @@ def apply_plan(stores: StorePaths, plan: JsonObject) -> JsonObject:
         "planned_actions": actions,
         "plan_action_count": len(actions),
         "backups": backups,
+        "compact_preflights": compact_preflights,
+        "file_preflights": file_preflights,
         "git_preflights": git_preflights,
         "applied_actions": applied,
         "next_commands": post_apply_next_commands(stores),
@@ -143,6 +168,34 @@ def validate_plan_header(plan: JsonObject, stores: StorePaths) -> None:
         raise CdxCareError("plan run_id must be canonical UUID text", code="invalid_run_id")
 
 
+def validate_plan_policy(plan: JsonObject, actions: list[JsonObject]) -> None:
+    """Bind manual lanes to the reviewed profile/policy recorded in the plan header."""
+    profile = plan.get("profile")
+    approved_policy = plan.get("approved_policy")
+    if profile == "workstation":
+        if approved_policy != "workstation-hide-broken-only":
+            raise CdxCareError("workstation plan approved_policy mismatch", code="plan_policy_mismatch")
+    elif profile == "clear-current-badge":
+        if approved_policy != "manual-clear-current-badge":
+            raise CdxCareError("clear-current-badge plan approved_policy mismatch", code="plan_policy_mismatch")
+    else:
+        raise CdxCareError("unsupported plan profile", code="unsupported_profile")
+    for action in actions:
+        if action.get("lane") != "automations.clear_current_badge":
+            continue
+        if profile != "clear-current-badge" or approved_policy != "manual-clear-current-badge":
+            raise CdxCareError(
+                "clear-current-badge actions require the manual reviewed profile",
+                code="plan_policy_mismatch",
+            )
+        extra = action.get("extra")
+        if not isinstance(extra, dict) or extra.get("manual_profile") != "clear-current-badge":
+            raise CdxCareError(
+                "clear-current-badge action missing manual profile metadata",
+                code="plan_policy_mismatch",
+            )
+
+
 def as_action_list(value: JsonValue | None) -> list[JsonObject]:
     """Validate and return a planned action list."""
     try:
@@ -153,7 +206,7 @@ def as_action_list(value: JsonValue | None) -> list[JsonObject]:
 
 def apply_context(stores: StorePaths, actions: list[JsonObject]) -> ApplyContext:
     """Build apply-time context, failing closed when read-state proof is unavailable."""
-    read_state_lanes = {"automations.hide_broken_only", "inbox.orphan_mark_read"}
+    read_state_lanes = {"automations.hide_broken_only", "automations.clear_current_badge", "inbox.orphan_mark_read"}
     needs_state = any(action.get("lane") in read_state_lanes for action in actions)
     now_seconds = epoch_seconds()
     now_ms = epoch_ms()
@@ -202,8 +255,128 @@ def preflight_git_actions(actions: list[JsonObject]) -> list[JsonObject]:
             paths_value = action.get("paths")
             if not isinstance(paths_value, list):
                 raise CdxCareError("git action paths must be strings", code="invalid_plan")
-            rows.append(git_hygiene_preflight(Path(str(action["repo"])), string_list(paths_value, "paths")))
+            rows.append(
+                git_hygiene_preflight(
+                    Path(str(action["repo"])),
+                    string_list(paths_value, "paths"),
+                    complete_paths=sorted(DS_STORE_PATHS),
+                )
+            )
     return rows
+
+
+def preflight_compact_actions(stores: StorePaths, actions: list[JsonObject]) -> list[JsonObject]:
+    """Verify SQLite compaction actions before backup."""
+    rows: list[JsonObject] = []
+    for action in actions:
+        if action.get("type") == "sqlite_compact":
+            if action.get("db") != "logs":
+                raise CdxCareError("SQLite compaction action must target logs DB", code="action_target_denied")
+            db_path = stores.db_path("logs")
+            verify_db_stat(db_path, [action])
+            with closing(connect_readonly(db_path)) as conn:
+                verify_schema(conn, [action])
+            rows.append(preflight_logs_compaction(db_path, action))
+    return rows
+
+
+def preflight_jsonl_actions(stores: StorePaths, actions: list[JsonObject]) -> list[JsonObject]:
+    """Verify JSONL rewrite actions before backup."""
+    rows: list[JsonObject] = []
+    for action in actions:
+        if action.get("type") == "jsonl_rewrite":
+            rows.append(preflight_jsonl_action(stores, action))
+    return rows
+
+
+def preflight_jsonl_action(stores: StorePaths, action: JsonObject) -> JsonObject:
+    """Verify one JSONL rewrite action without exposing row bodies."""
+    target = Path(str(action["path"]))
+    source = action.get("source")
+    if not isinstance(source, dict):
+        raise CdxCareError("JSONL rewrite action missing source state", code="invalid_plan")
+    verify_state_source(stores.db_path("state"), source)
+    verify_file_stat(target, require_json_object(action.get("target_stat"), "target_stat"))
+    alignment = verify_session_file_alignment(stores.db_path("state"), stores.codex_home / "sessions")
+    if alignment["state_not_in_session_file_ids"] or alignment["session_file_ids_not_in_state"]:
+        raise CdxCareError("state thread IDs and rollout files differ before JSONL repair", code="row_drift")
+    lane = str(action.get("lane"))
+    if lane == "sessions.rebuild_session_index":
+        content, count = desired_session_index_bytes(stores.db_path("state"), stores.session_index)
+        actual_sha = sha256_bytes(content)
+        if actual_sha != action.get("desired_sha256") or len(content) != action.get("desired_bytes"):
+            raise CdxCareError("session index desired output changed before apply", code="row_drift")
+        return {"lane": lane, "path": str(target), "desired_sha256": actual_sha, "desired_row_count": count}
+    raise CdxCareError("JSONL rewrite action is outside cdx-care policy", code="action_target_denied")
+
+
+def backup_jsonl_targets(actions: list[JsonObject], backup_root: Path) -> list[JsonObject]:
+    """Back up JSONL rewrite targets before replacement."""
+    rows: list[JsonObject] = []
+    file_root = backup_root / "files"
+    for action in actions:
+        if action.get("type") != "jsonl_rewrite":
+            continue
+        target = Path(str(action["path"]))
+        ensure_private_dir(file_root)
+        backup_name = target.name
+        backup_path = file_root / backup_name
+        if target.exists():
+            copy_private_file(target, backup_path)
+            rows.append(
+                {
+                    "source": str(target),
+                    "target": str(backup_path),
+                    "bytes": backup_path.stat().st_size,
+                    "sha256": file_sha256(backup_path),
+                    "kind": "jsonl",
+                }
+            )
+    return rows
+
+
+def apply_compact_action(stores: StorePaths, action: JsonObject) -> JsonObject:
+    """Apply a SQLite compaction action."""
+    preflight_compact_actions(stores, [action])
+    result = compact_logs_db(stores.db_path("logs"), action)
+    return {"id": str(action["id"]), "type": "sqlite_compact", "lane": str(action["lane"]), "result": result}
+
+
+def apply_jsonl_action(stores: StorePaths, action: JsonObject, backup_root: Path) -> JsonObject:
+    """Apply an admitted JSONL rewrite action."""
+    lane = str(action.get("lane"))
+    target = Path(str(action["path"]))
+    if lane == "sessions.rebuild_session_index":
+        preflight_jsonl_action(stores, action)
+        content, row_count = desired_session_index_bytes(stores.db_path("state"), stores.session_index)
+        replace_file_from_private_temp(target, content, backup_root / "session_index.new")
+        return {
+            "id": str(action["id"]),
+            "type": "jsonl_rewrite",
+            "lane": lane,
+            "path": str(target),
+            "sha256": sha256_bytes(content),
+            "row_count": row_count,
+            "target_stat": file_stat(target),
+        }
+    raise CdxCareError("JSONL rewrite action is outside cdx-care policy", code="action_target_denied")
+
+
+def replace_file_from_private_temp(target: Path, content: bytes, temp_path: Path) -> None:
+    """Write bytes to a private temp path, then atomically replace the target."""
+    write_private_file(temp_path, content)
+    os.replace(temp_path, target)
+    os.chmod(target, 0o600)
+
+
+def write_private_file(path: Path, content: bytes) -> None:
+    """Write a new private file exactly once."""
+    if path.exists() or path.is_symlink():
+        raise CdxCareError(f"private write target already exists: {path}", code="output_exists")
+    ensure_private_dir(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(content)
 
 
 def apply_git_action(action: JsonObject) -> JsonObject:
@@ -214,5 +387,6 @@ def apply_git_action(action: JsonObject) -> JsonObject:
     if not isinstance(paths_value, list):
         raise CdxCareError("git action paths must be strings", code="invalid_plan")
     paths = string_list(paths_value, "paths")
-    result = git_rm_cached(Path(str(action["repo"])), paths, require_exact_tracked=True)
+    message = str(action.get("commit_message", "Untrack Codex memory Finder metadata"))
+    result = git_untrack_and_commit(Path(str(action["repo"])), paths, message, complete_paths=sorted(DS_STORE_PATHS))
     return {"id": str(action["id"]), "type": "git_rm_cached", "lane": str(action["lane"]), "result": result}

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -82,7 +83,7 @@ class CdxCareCliReportTest(unittest.TestCase):
             self.assertIn("codex.state_threads.unavailable", {str(row["code"]) for row in findings})
             self.assertFalse(codex_dev["state_threads_available"])
             self.assertEqual(1, runs["broken_unread_count"])
-            self.assertEqual(2, runs["state_unknown_unread_count"])
+            self.assertEqual(3, runs["state_unknown_unread_count"])
             self.assertEqual(0, inbox["orphan_unread_count"])
             unknown_count = inbox["orphan_detection_unknown_unread_count"]
             if not isinstance(unknown_count, int):
@@ -127,6 +128,12 @@ class CdxCareCliReportTest(unittest.TestCase):
             self.assertFalse(require_json_object(payload["details"], "details")["included"])
             self.assertFalse(contains_key(payload, "review_rows"))
             self.assertFalse(contains_key(payload, "handles"))
+            findings = require_json_object_list(payload["findings"], "findings")
+            self.assertIn("codex.automation_badge.unread_run_instances", {str(row["code"]) for row in findings})
+            next_commands = payload["next_commands"]
+            if not isinstance(next_commands, list):
+                raise AssertionError("next_commands must be a list")
+            self.assertIn("plan --profile clear-current-badge", " ".join(str(row) for row in next_commands))
             lsof = require_json_object(payload["lsof"], "lsof")
             self.assertIn("handle_count", lsof)
             codex_dev = require_json_object(payload["codex_dev"], "codex_dev")
@@ -202,6 +209,69 @@ class CdxCareCliReportTest(unittest.TestCase):
             self.assertEqual(0o600, receipt_path.stat().st_mode & 0o777)
             self.assertIn("doctor", str(payload["next_commands"]))
             self.assertEqual("", err.getvalue())
+
+    def test_cli_run_denies_clear_current_badge_one_shot_without_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+
+            exit_code, payload, stderr = run_cli_json(
+                [
+                    "--json",
+                    "--codex-home",
+                    str(stores.codex_home),
+                    "run",
+                    "--profile",
+                    "clear-current-badge",
+                    "--apply-approved",
+                ]
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(
+                "manual_profile_requires_plan_review",
+                require_json_object(payload["error"], "error")["code"],
+            )
+            next_step = str(require_json_object(payload["error"], "error")["next_step"])
+            self.assertIn("plan --profile clear-current-badge", next_step)
+            self.assertIn("apply --plan", next_step)
+            self.assertNotIn("rerun the same command", next_step.lower())
+            self.assertFalse((stores.care_root / "plans").exists())
+            self.assertFalse((stores.care_root / "receipts").exists())
+            with closing(sqlite3.connect(stores.db_path("codex-dev"))) as conn:
+                read_count = conn.execute(
+                    "SELECT COUNT(*) FROM automation_runs WHERE thread_id IN ('thread-good', 'thread-accepted') "
+                    "AND read_at IS NOT NULL"
+                ).fetchone()[0]
+            self.assertEqual(0, read_count)
+            self.assertEqual("", stderr)
+
+    def test_cli_run_denies_clear_current_badge_without_apply_approved_as_manual_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+
+            exit_code, payload, stderr = run_cli_json(
+                [
+                    "--json",
+                    "--codex-home",
+                    str(stores.codex_home),
+                    "run",
+                    "--profile",
+                    "clear-current-badge",
+                ]
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertFalse(payload["ok"])
+            error = require_json_object(payload["error"], "error")
+            self.assertEqual("manual_profile_requires_plan_review", error["code"])
+            next_step = str(error["next_step"])
+            self.assertIn("plan --profile clear-current-badge", next_step)
+            self.assertIn("apply --plan", next_step)
+            self.assertNotIn("--apply-approved", next_step)
+            self.assertFalse((stores.care_root / "plans").exists())
+            self.assertFalse((stores.care_root / "receipts").exists())
+            self.assertEqual("", stderr)
 
     def test_cli_apply_denials_are_json_and_do_not_create_receipts_before_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

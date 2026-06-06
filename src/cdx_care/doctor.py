@@ -380,9 +380,12 @@ def state_report(stores: StorePaths) -> JsonObject:
 
 def ds_store_report(memory_root: Path) -> JsonObject:
     """Inspect tracked .DS_Store files in the memory git repo."""
-    from cdx_care.git_tools import tracked_paths
+    from cdx_care.git_tools import head_tracked_paths, tracked_paths
 
-    tracked = tracked_paths(memory_root, [".DS_Store", "extensions/.DS_Store"])
+    targets = [".DS_Store", "extensions/.DS_Store"]
+    tracked_index = tracked_paths(memory_root, targets)
+    tracked_head = head_tracked_paths(memory_root, targets)
+    tracked = sorted(set(tracked_index) | set(tracked_head))
     findings: list[JsonValue] = []
     if tracked:
         findings.append(
@@ -390,7 +393,15 @@ def ds_store_report(memory_root: Path) -> JsonObject:
                 "codex.memory.git_tracked_ds_store",
                 "warn",
                 "Finder metadata is tracked in the memory git repo; it should be untracked and ignored.",
-                {"paths": tracked},
+                {"paths": tracked, "index_paths": tracked_index, "head_paths": tracked_head},
             )
         )
-    return {"data": {"repo": str(memory_root), "tracked_ds_store": tracked}, "findings": findings}
+    return {
+        "data": {
+            "repo": str(memory_root),
+            "tracked_ds_store": tracked,
+            "tracked_index_ds_store": tracked_index,
+            "tracked_head_ds_store": tracked_head,
+        },
+        "findings": findings,
+    }

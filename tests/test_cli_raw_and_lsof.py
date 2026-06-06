@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -17,7 +18,7 @@ from cdx_care_fixtures import make_fixture
 
 import cdx_care.cli as cli_module
 from cdx_care.errors import CdxCareError
-from cdx_care.processes import lsof_handles, parse_lsof_stdout
+from cdx_care.processes import lsof_handles, parse_lsof_stdout, run_lsof_command
 from cdx_care.raw_sql import raw_sql_readonly, validate_query_shape
 from cdx_care.types import require_json_object
 
@@ -183,7 +184,7 @@ class CdxCareRawSqlAndLsofTest(unittest.TestCase):
                 stdout="",
                 stderr="lsof: status error on file: Operation not permitted\n",
             )
-            with patch("cdx_care.processes.subprocess.run", return_value=result):
+            with patch("cdx_care.processes.run_lsof_command", return_value=result):
                 available, rows = lsof_handles([db_path])
 
             self.assertFalse(available)
@@ -199,7 +200,7 @@ class CdxCareRawSqlAndLsofTest(unittest.TestCase):
                 stdout="COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n",
                 stderr="lsof: warning: partial visibility\n",
             )
-            with patch("cdx_care.processes.subprocess.run", return_value=result):
+            with patch("cdx_care.processes.run_lsof_command", return_value=result):
                 available, rows = lsof_handles([db_path])
 
             self.assertFalse(available)
@@ -221,10 +222,35 @@ class CdxCareRawSqlAndLsofTest(unittest.TestCase):
             result = subprocess.CompletedProcess(args=[str(trusted), str(db_path)], returncode=1, stdout="", stderr="")
             with patch.dict(os.environ, {"PATH": str(fake_dir)}), patch(
                 "cdx_care.processes.TRUSTED_LSOF_PATH", trusted
-            ), patch("cdx_care.processes.subprocess.run", return_value=result) as run:
+            ), patch("cdx_care.processes.run_lsof_command", return_value=result) as run:
                 available, rows = lsof_handles([db_path])
 
             self.assertTrue(available)
             self.assertEqual([], rows)
             args = run.call_args.args[0]
             self.assertEqual(str(trusted), args[0])
+
+    def test_lsof_command_timeout_fails_closed_without_waiting_forever(self) -> None:
+        class HangingProcess:
+            pid = 12345
+            returncode: int | None = None
+
+            def __init__(self) -> None:
+                self.communicate_calls = 0
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                self.communicate_calls += 1
+                raise subprocess.TimeoutExpired(["lsof"], timeout if timeout is not None else 0)
+
+            def kill(self) -> None:
+                raise ProcessLookupError
+
+        process = HangingProcess()
+        with patch("cdx_care.processes.subprocess.Popen", return_value=process), patch(
+            "cdx_care.processes.os.killpg"
+        ) as killpg:
+            result = run_lsof_command(["/usr/sbin/lsof", "/tmp/example.sqlite"])
+
+        self.assertIsNone(result)
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+        self.assertEqual(2, process.communicate_calls)

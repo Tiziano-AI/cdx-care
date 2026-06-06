@@ -37,8 +37,6 @@ def create_private_dir(path: Path) -> None:
 def ensure_parent_dir(path: Path) -> None:
     """Ensure missing parent directories are private without chmodding existing parents."""
     parent = path.parent
-    if parent.is_symlink():
-        raise CdxCareError(f"parent directory is a symlink: {parent}", code="unsafe_output_path")
     if parent.exists():
         if not parent.is_dir():
             raise CdxCareError(f"parent path is not a directory: {parent}", code="output_exists")
@@ -56,7 +54,7 @@ def create_private_dir_tree(path: Path) -> None:
         if parent == cursor:
             raise CdxCareError(f"cannot create directory tree from filesystem root: {path}", code="unsafe_output_path")
         cursor = parent
-    if cursor.is_symlink() or not cursor.is_dir():
+    if not cursor.is_dir():
         raise CdxCareError(f"existing parent is not an owned directory: {cursor}", code="unsafe_output_path")
     for directory in reversed(missing):
         if directory.is_symlink():

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cdx_care.errors import CdxCareError
+from cdx_care.memory_reports import memory_error_category
 from cdx_care.paths import StorePaths
 from cdx_care.policy_checks import (
     DEFAULT_STAGE1_RETRY_REMAINING,
@@ -22,11 +23,12 @@ from cdx_care.policy_checks import (
     require_preconditions,
     require_schema_fingerprint,
     require_schema_tables,
-    string_list,
 )
+from cdx_care.policy_targets import DS_STORE_PATHS as _DS_STORE_PATHS
+from cdx_care.policy_targets import validate_git_target, validate_jsonl_rewrite_target, validate_sqlite_compact_target
 from cdx_care.types import JsonObject
 
-DS_STORE_PATHS = {".DS_Store", "extensions/.DS_Store"}
+DS_STORE_PATHS = _DS_STORE_PATHS
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,10 @@ def validate_action_targets(stores: StorePaths, actions: list[JsonObject]) -> No
             validate_sqlite_update_target(stores, action)
         elif action_type == "sqlite_insert":
             validate_sqlite_insert_target(stores, action)
+        elif action_type == "sqlite_compact":
+            validate_sqlite_compact_target(stores, action)
+        elif action_type == "jsonl_rewrite":
+            validate_jsonl_rewrite_target(stores, action)
         elif action_type == "git_rm_cached":
             validate_git_target(stores, action)
         else:
@@ -57,7 +63,7 @@ def admitted_db_paths(stores: StorePaths, actions: list[JsonObject]) -> list[Pat
     paths = {
         stores.db_path(str(action["db"]))
         for action in actions
-        if action.get("type") in ("sqlite_update", "sqlite_insert")
+        if action.get("type") in ("sqlite_update", "sqlite_insert", "sqlite_compact")
     }
     return sorted(paths)
 
@@ -81,7 +87,10 @@ def validate_sqlite_update_target(stores: StorePaths, action: JsonObject) -> Non
     db = str(action.get("db"))
     key = object_map(action.get("key"), "key")
     updates = object_map(action.get("updates"), "updates")
-    if (lane, db, table) == ("automations.hide_broken_only", "codex-dev", "automation_runs"):
+    if (lane, db, table) in {
+        ("automations.hide_broken_only", "codex-dev", "automation_runs"),
+        ("automations.clear_current_badge", "codex-dev", "automation_runs"),
+    }:
         validate_sqlite_common(stores, action, db="codex-dev", table="automation_runs", lane=lane)
         require_schema_tables(
             action,
@@ -134,8 +143,6 @@ def validate_sqlite_update_target(stores: StorePaths, action: JsonObject) -> Non
                 "retry_at": "equals",
                 "retry_remaining": "equals",
                 "last_error": "sha256",
-                "input_watermark": "equals",
-                "last_success_watermark": "equals",
             },
             "memory stage1 retry preconditions",
         )
@@ -175,8 +182,6 @@ def validate_sqlite_update_target(stores: StorePaths, action: JsonObject) -> Non
                 "lease_until": "equals",
                 "retry_at": "equals",
                 "retry_remaining": "equals",
-                "input_watermark": "equals",
-                "last_success_watermark": "equals",
                 "last_error": "sha256",
             },
             "memory global consolidation preconditions",
@@ -254,23 +259,6 @@ def validate_sqlite_insert_target(stores: StorePaths, action: JsonObject) -> Non
         raise CdxCareError("memory global insert last_success_watermark must be zero", code="action_target_denied")
 
 
-def validate_git_target(stores: StorePaths, action: JsonObject) -> None:
-    """Validate a planned git hygiene action against the closed v1 policy."""
-    if action.get("lane") != "memory.git_hygiene":
-        raise CdxCareError("git action lane is outside cdx-care policy", code="git_target_denied")
-    repo = action.get("repo")
-    if not isinstance(repo, str):
-        raise CdxCareError("git action repo must be a string", code="invalid_plan")
-    if normalized_path(Path(repo)) != normalized_path(stores.memories_root):
-        raise CdxCareError("git action repo must be the Codex memory repo", code="git_target_denied")
-    paths_value = action.get("paths")
-    if not isinstance(paths_value, list):
-        raise CdxCareError("git action paths must be strings", code="invalid_plan")
-    paths = string_list(paths_value, "paths")
-    if not paths or len(set(paths)) != len(paths) or not set(paths).issubset(DS_STORE_PATHS):
-        raise CdxCareError("git action paths must be the admitted memory .DS_Store paths", code="git_target_denied")
-
-
 def verify_lane_eligibility(row: sqlite3.Row, action: JsonObject, context: ApplyContext) -> None:
     """Re-check current row eligibility independently from plan preconditions."""
     lane = str(action.get("lane"))
@@ -279,6 +267,15 @@ def verify_lane_eligibility(row: sqlite3.Row, action: JsonObject, context: Apply
         status = str(row["status"] or "")
         if row["read_at"] is not None or (status != "ARCHIVED" and thread_id in context.state_thread_ids):
             raise CdxCareError("automation run is not eligible for hide-broken mark-read", code="row_not_eligible")
+        verify_mark_read_timestamp(row, action, context, lower_column="updated_at", label="automation read_at")
+        return
+    if lane == "automations.clear_current_badge":
+        thread_id = str(row["thread_id"] or "")
+        status = str(row["status"] or "")
+        if row["read_at"] is not None or status not in {"PENDING_REVIEW", "ACCEPTED"}:
+            raise CdxCareError("automation run is not an unread badge review row", code="row_not_eligible")
+        if not thread_id or thread_id not in context.state_thread_ids:
+            raise CdxCareError("automation badge row is not navigable from state threads", code="row_not_eligible")
         verify_mark_read_timestamp(row, action, context, lower_column="updated_at", label="automation read_at")
         return
     if lane == "inbox.orphan_mark_read":
@@ -295,12 +292,22 @@ def verify_lane_eligibility(row: sqlite3.Row, action: JsonObject, context: Apply
             or int(row["lease_until"] or 0) > context.now_seconds
         ):
             raise CdxCareError("memory Stage 1 job is not an exhausted idle error", code="row_not_eligible")
+        if memory_error_category(str(row["last_error"] or "")) == "auth":
+            raise CdxCareError(
+                "memory Stage 1 auth errors require credential repair before retry",
+                code="row_not_eligible",
+            )
         return
     if lane == "memory.force_global_consolidation":
         if str(row["kind"]) != "memory_consolidate_global" or str(row["job_key"]) != "global":
             raise CdxCareError("memory global action must target the native global job", code="row_not_eligible")
         if int(row["lease_until"] or 0) > context.now_seconds:
             raise CdxCareError("memory global job has a future lease", code="row_not_eligible")
+        if memory_error_category(str(row["last_error"] or "")) == "auth":
+            raise CdxCareError(
+                "memory global auth errors require credential repair before enqueue",
+                code="row_not_eligible",
+            )
         updates = object_map(action.get("updates"), "updates")
         next_watermark = updates.get("input_watermark")
         current_watermark = int(row["input_watermark"] or 0)
@@ -312,6 +319,27 @@ def verify_lane_eligibility(row: sqlite3.Row, action: JsonObject, context: Apply
             )
         return
     raise CdxCareError("action lane has no eligibility policy", code="action_target_denied")
+
+
+def verify_memory_auth_blockers(conn: sqlite3.Connection, action: JsonObject) -> None:
+    """Deny native memory worker mutations while current jobs show credential/auth failure."""
+    if action.get("lane") not in {"memory.stage1_retry_terminal_errors", "memory.force_global_consolidation"}:
+        return
+    rows = conn.execute(
+        """
+        SELECT kind, job_key, last_error
+        FROM jobs
+        WHERE last_error IS NOT NULL
+          AND kind IN ('memory_stage1', 'memory_consolidate_global')
+        ORDER BY kind, job_key
+        """
+    ).fetchall()
+    for row in rows:
+        if memory_error_category(str(row["last_error"] or "")) == "auth":
+            raise CdxCareError(
+                "memory auth errors require credential repair before memory reconciliation",
+                code="row_not_eligible",
+            )
 
 
 def verify_mark_read_timestamp(

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from pathlib import Path
 
 from cdx_care.types import JsonObject
 
 TRUSTED_LSOF_PATH = Path("/usr/sbin/lsof")
+LSOF_TIMEOUT_SECONDS = 15
+LSOF_KILL_GRACE_SECONDS = 1
 
 
 def lsof_handles(paths: list[Path]) -> tuple[bool, list[JsonObject]]:
@@ -19,17 +22,8 @@ def lsof_handles(paths: list[Path]) -> tuple[bool, list[JsonObject]]:
     lsof_path = trusted_lsof_path()
     if lsof_path is None:
         return False, []
-    try:
-        result = subprocess.run(
-            [str(lsof_path), *[str(path) for path in existing]],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except FileNotFoundError:
-        return False, []
-    except subprocess.TimeoutExpired:
+    result = run_lsof_command([str(lsof_path), *[str(path) for path in existing]])
+    if result is None:
         return False, []
     stderr = result.stderr.strip()
     if stderr:
@@ -40,6 +34,43 @@ def lsof_handles(paths: list[Path]) -> tuple[bool, list[JsonObject]]:
         return False, []
     parsed, rows = parse_lsof_stdout(result.stdout)
     return parsed, rows
+
+
+def run_lsof_command(args: list[str]) -> subprocess.CompletedProcess[str] | None:
+    """Run lsof without allowing an unkillable child wait to block cdx-care."""
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        stdout, stderr = proc.communicate(timeout=LSOF_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        kill_process_group(proc)
+        return None
+    return subprocess.CompletedProcess(args=args, returncode=proc.returncode, stdout=stdout, stderr=stderr)
+
+
+def kill_process_group(proc: subprocess.Popen[str]) -> None:
+    """Best-effort kill of a timed-out lsof process group without blocking forever."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+    try:
+        proc.communicate(timeout=LSOF_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return
 
 
 def trusted_lsof_path() -> Path | None:

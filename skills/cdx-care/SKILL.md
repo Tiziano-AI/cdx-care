@@ -10,8 +10,8 @@ operator's Codex support root: automation badge/read-state, memory job retries,
 memory git `.DS_Store` hygiene, session/history/index drift, logs DB health, or
 blank automations page evidence.
 
-Do not use it to edit vendor/upstream Codex source, clear valid review runs by
-default, rebuild session indexes, compact logs, or run raw SQL writes.
+Do not use it to edit vendor/upstream Codex source, clear valid review runs
+with the default profile, rewrite `history.jsonl`, or run raw SQL writes.
 
 ## First command
 
@@ -39,7 +39,8 @@ details or raw `lsof` handle rows.
    ```
 
 3. Review `planned_actions[]` and `denials[]`. Default policy is
-   `hide broken only`: valid `PENDING_REVIEW` automation runs remain unread.
+   `hide broken only`: valid `PENDING_REVIEW`/`ACCEPTED` automation runs remain
+   unread.
 4. Quit Codex before any apply.
 5. Apply only an approved plan:
 
@@ -59,6 +60,18 @@ details or raw `lsof` handle rows.
    up DBs, revalidates plan targets, applies with old-value checks, and writes a
    receipt. If `lsof` is unavailable or ambiguous, writes deny until handle
    proof works again.
+
+   If the operator explicitly wants the current automation badge cleared, use
+   the review-first opt-in profile instead. It marks valid, navigable unread
+   `PENDING_REVIEW`/`ACCEPTED` run instances read, not only broken rows:
+
+   ```bash
+   cdx-care --json plan --profile clear-current-badge --out /tmp/cdx-care-clear-badge-plan.json
+   cdx-care --json apply --plan /tmp/cdx-care-clear-badge-plan.json
+   ```
+
+   Do not use `run --profile clear-current-badge --apply-approved`; the CLI
+   intentionally denies that shortcut so the valid badge rows are reviewed first.
 
 6. Reopen Codex and rerun `cdx-care --json doctor` plus the user-visible app
    check. A DB receipt is not rendered UI proof.
@@ -88,11 +101,19 @@ explicitly wants local raw evidence.
 ## Authorization boundaries
 
 `apply` and `run --apply-approved` must deny DB writes while Codex has handles
-open. They back up DB/WAL/SHM, verify schema and old row values, apply in
+open. They back up DB/WAL/SHM, verify schema and row preconditions, apply in
 SQLite transactions, revalidate editable plan fields against the closed policy,
-write receipts, and refuse reused run IDs or existing output files. Do not
-bypass these gates with manual SQL unless the user explicitly asks for a one-off
-outside the product lane.
+write receipts, and refuse reused run IDs or existing output files. Memory
+auth/401 errors are blockers, not retry candidates. Do not bypass these gates
+with manual SQL unless the user explicitly asks for a one-off outside the
+product lane.
+
+The workstation plan may also rebuild `session_index.jsonl` and compact
+`logs_2.sqlite` when the closed policy proves those actions are currently safe.
+The session lane writes only the legacy thread-name index after rollout-file
+alignment proof: it replaces distinct `state_5.sqlite` titles and preserves
+latest valid legacy fallback names for threads whose SQLite title is still
+blank/default. `history.jsonl` is message history and remains diagnostic-only.
 
 Managed `~/.codex/cdx-care/**` artifact directories for generated run plans,
 backups, and receipts are forced private (`0700`), and generated files are

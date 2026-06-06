@@ -9,15 +9,13 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from cdx_care_fixtures import fake_lsof_handles, fake_lsof_unavailable, first_action, make_fixture, require_actions
+from cdx_care_fixtures import first_action, make_fixture, require_actions
 
-import cdx_care.apply as apply_module
 from cdx_care.apply import apply_plan
 from cdx_care.errors import CdxCareError
-from cdx_care.git_tools import tracked_paths
+from cdx_care.git_tools import head_tracked_paths, tracked_paths
 from cdx_care.plan import generate_plan
-from cdx_care.plan_actions import stat_snapshot
-from cdx_care.sqlite_tools import connect_readonly, connect_write, schema_fingerprint
+from cdx_care.sqlite_tools import connect_write
 
 
 class CdxCareFixtureTest(unittest.TestCase):
@@ -33,14 +31,34 @@ class CdxCareFixtureTest(unittest.TestCase):
             plan_json = json.dumps(plan, sort_keys=True)
 
             self.assertNotIn("automation-run-mark-read:thread-good:auto-good", action_ids)
+            self.assertNotIn("automation-run-mark-read:thread-accepted:auto-good", action_ids)
+            self.assertNotIn("automation-run-clear-badge:thread-good:auto-good", action_ids)
             self.assertIn("automation-run-mark-read:thread-archived:auto-good", action_ids)
             self.assertIn("automation-run-mark-read:thread-missing:auto-good", action_ids)
             self.assertIn("inbox-orphan-mark-read:inbox-orphan", action_ids)
             self.assertIn("memory-stage1-retry:thread-memory-error", action_ids)
             self.assertIn("memory-global-consolidation-enqueue", action_ids)
+            self.assertIn("sessions-rebuild-session-index", action_ids)
+            self.assertNotIn(str(stores.history), {str(action.get("path", "")) for action in actions})
+            self.assertIn("logs-compact-freelist", action_ids)
             self.assertIn("memory-git-untrack-ds-store", action_ids)
             self.assertNotIn("old-token", plan_json)
+            self.assertNotIn("private orphan", plan_json)
             self.assertEqual([], plan["denials"])
+
+    def test_clear_current_badge_profile_plans_valid_review_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+
+            plan = generate_plan(stores, "clear-current-badge")
+            actions = require_actions(plan)
+            action_ids = {str(action["id"]) for action in actions}
+
+            self.assertEqual("manual-clear-current-badge", plan["approved_policy"])
+            self.assertIn("automation-run-clear-badge:thread-good:auto-good", action_ids)
+            self.assertIn("automation-run-clear-badge:thread-accepted:auto-good", action_ids)
+            self.assertIn("automation-run-mark-read:thread-missing:auto-good", action_ids)
+            self.assertNotIn("automation-run-clear-badge:thread-missing:auto-good", action_ids)
 
     def test_apply_updates_only_planned_rows_and_writes_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,11 +88,15 @@ class CdxCareFixtureTest(unittest.TestCase):
                 valid_read_at = conn.execute(
                     "SELECT read_at FROM automation_runs WHERE thread_id='thread-good'"
                 ).fetchone()[0]
+                accepted_read_at = conn.execute(
+                    "SELECT read_at FROM automation_runs WHERE thread_id='thread-accepted'"
+                ).fetchone()[0]
                 archived_read_at = conn.execute(
                     "SELECT read_at FROM automation_runs WHERE thread_id='thread-archived'"
                 ).fetchone()[0]
                 inbox_read_at = conn.execute("SELECT read_at FROM inbox_items WHERE id='inbox-orphan'").fetchone()[0]
             self.assertIsNone(valid_read_at)
+            self.assertIsNone(accepted_read_at)
             self.assertIsNotNone(archived_read_at)
             self.assertIsNotNone(inbox_read_at)
             with closing(sqlite3.connect(stores.db_path("memories"))) as conn:
@@ -84,93 +106,51 @@ class CdxCareFixtureTest(unittest.TestCase):
                 global_row = conn.execute(
                     "SELECT status, retry_remaining FROM jobs WHERE kind='memory_consolidate_global'"
                 ).fetchone()
+            with closing(sqlite3.connect(stores.db_path("logs"))) as conn:
+                log_row_count = conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
+                freelist_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
             self.assertEqual(("pending", 3, None), row)
             self.assertEqual(("pending", 3), global_row)
+            self.assertEqual(1, log_row_count)
+            self.assertEqual(0, freelist_after)
+            index_rows = [
+                json.loads(line) for line in stores.session_index.read_text(encoding="utf-8").splitlines() if line
+            ]
+            self.assertEqual(["thread-good", "thread-default", "thread-accepted"], [row["id"] for row in index_rows])
+            self.assertEqual(["valid", "legacy fallback", "accepted"], [row["thread_name"] for row in index_rows])
+            history_rows = [
+                json.loads(line) for line in stores.history.read_text(encoding="utf-8").splitlines() if line
+            ]
+            self.assertEqual(["thread-good", "thread-history-orphan"], [row["session_id"] for row in history_rows])
+            quarantine = stores.care_root / "backups" / str(plan["run_id"]) / "files" / "history.orphans.jsonl"
+            self.assertFalse(quarantine.exists())
             self.assertEqual([], tracked_paths(stores.memories_root, [".DS_Store", "extensions/.DS_Store"]))
+            self.assertEqual([], head_tracked_paths(stores.memories_root, [".DS_Store", "extensions/.DS_Store"]))
             self.assertTrue((stores.memories_root / ".DS_Store").exists())
             with self.assertRaises(CdxCareError) as caught:
                 apply_plan(stores, plan)
             self.assertEqual("run_id_reused", caught.exception.code)
 
-    def test_apply_denies_when_db_changed_after_plan(self) -> None:
+    def test_clear_current_badge_profile_marks_valid_review_rows_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stores = make_fixture(Path(tmp))
-            plan = generate_plan(stores, "workstation")
+            plan = generate_plan(stores, "clear-current-badge")
+
+            apply_plan(stores, plan)
+
             with closing(sqlite3.connect(stores.db_path("codex-dev"))) as conn:
-                conn.execute("UPDATE automation_runs SET updated_at=999 WHERE thread_id='thread-archived'")
-                conn.commit()
-
-            with self.assertRaises(CdxCareError) as caught:
-                apply_plan(stores, plan)
-            self.assertIn(caught.exception.code, {"db_changed", "row_drift"})
-
-    def test_schema_fingerprint_tracks_triggers_and_apply_denies_them_before_backup(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            stores = make_fixture(Path(tmp))
-            plan = generate_plan(stores, "workstation")
-            action = first_action(plan, "automation-run-mark-read:thread-archived:auto-good")
-            before = str(action["schema_fingerprint"])
-            with closing(sqlite3.connect(stores.db_path("codex-dev"))) as conn:
-                conn.execute(
-                    """
-                    CREATE TRIGGER automation_runs_side_effect
-                    AFTER UPDATE ON automation_runs
-                    BEGIN
-                      UPDATE inbox_items SET read_at=123 WHERE id='inbox-valid';
-                    END
-                    """
-                )
-                conn.commit()
-            with closing(connect_readonly(stores.db_path("codex-dev"))) as conn:
-                self.assertNotEqual(before, schema_fingerprint(conn, ["automation_runs"]))
-            action["db_stat"] = stat_snapshot(stores.db_path("codex-dev"))
-            plan["planned_actions"] = [action]
-
-            with self.assertRaises(CdxCareError) as caught:
-                apply_plan(stores, plan)
-
-            self.assertEqual("schema_side_effects", caught.exception.code)
-            self.assertFalse((stores.care_root / "backups" / str(plan["run_id"])).exists())
-
-    def test_apply_denies_when_lsof_reports_handles(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            stores = make_fixture(Path(tmp))
-            plan = generate_plan(stores, "workstation")
-            original = apply_module.lsof_handles
-            apply_module.lsof_handles = fake_lsof_handles
-            try:
-                with self.assertRaises(CdxCareError) as caught:
-                    apply_plan(stores, plan)
-            finally:
-                apply_module.lsof_handles = original
-            self.assertEqual("codex_db_handles_open", caught.exception.code)
-
-    def test_apply_denies_when_lsof_is_unavailable_before_backup(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            stores = make_fixture(Path(tmp))
-            plan = generate_plan(stores, "workstation")
-            original = apply_module.lsof_handles
-            apply_module.lsof_handles = fake_lsof_unavailable
-            try:
-                with self.assertRaises(CdxCareError) as caught:
-                    apply_plan(stores, plan)
-            finally:
-                apply_module.lsof_handles = original
-
-            self.assertEqual("lsof_unavailable", caught.exception.code)
-            run_id = str(plan["run_id"])
-            self.assertFalse((stores.care_root / "backups" / run_id).exists())
-            self.assertFalse((stores.care_root / "receipts" / f"{run_id}.json").exists())
-
-    def test_apply_denies_tampered_run_id_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            stores = make_fixture(Path(tmp))
-            plan = generate_plan(stores, "workstation")
-            plan["run_id"] = "../escape"
-
-            with self.assertRaises(CdxCareError) as caught:
-                apply_plan(stores, plan)
-            self.assertEqual("invalid_run_id", caught.exception.code)
+                valid_read_at = conn.execute(
+                    "SELECT read_at FROM automation_runs WHERE thread_id='thread-good'"
+                ).fetchone()[0]
+                accepted_read_at = conn.execute(
+                    "SELECT read_at FROM automation_runs WHERE thread_id='thread-accepted'"
+                ).fetchone()[0]
+                missing_read_at = conn.execute(
+                    "SELECT read_at FROM automation_runs WHERE thread_id='thread-missing'"
+                ).fetchone()[0]
+            self.assertIsNotNone(valid_read_at)
+            self.assertIsNotNone(accepted_read_at)
+            self.assertIsNotNone(missing_read_at)
 
     def test_apply_denies_tampered_eligible_automation_lane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -187,6 +167,38 @@ class CdxCareFixtureTest(unittest.TestCase):
             with self.assertRaises(CdxCareError) as caught:
                 apply_plan(stores, plan)
             self.assertEqual("row_not_eligible", caught.exception.code)
+
+    def test_apply_denies_tampered_clear_badge_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            plan = generate_plan(stores, "clear-current-badge")
+            action = first_action(plan, "automation-run-clear-badge:thread-good:auto-good")
+            action["key"] = {"thread_id": "thread-archived", "automation_id": "auto-good"}
+            action["preconditions"] = [
+                {"column": "status", "equals": "ARCHIVED"},
+                {"column": "read_at", "is_null": True},
+                {"column": "updated_at", "equals": 21},
+            ]
+
+            with self.assertRaises(CdxCareError) as caught:
+                apply_plan(stores, plan)
+            self.assertEqual("row_not_eligible", caught.exception.code)
+
+    def test_apply_denies_clear_badge_lane_in_workstation_plan_before_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            workstation_plan = generate_plan(stores, "workstation")
+            manual_plan = generate_plan(stores, "clear-current-badge")
+            workstation_plan["planned_actions"] = [
+                first_action(manual_plan, "automation-run-clear-badge:thread-good:auto-good")
+            ]
+
+            with self.assertRaises(CdxCareError) as caught:
+                apply_plan(stores, workstation_plan)
+
+            self.assertEqual("plan_policy_mismatch", caught.exception.code)
+            self.assertFalse((stores.care_root / "backups" / str(workstation_plan["run_id"])).exists())
+            self.assertFalse((stores.care_root / "receipts" / f"{workstation_plan['run_id']}.json").exists())
 
     def test_apply_denies_tampered_mark_read_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

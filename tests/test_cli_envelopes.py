@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -69,6 +70,68 @@ class CdxCareCliEnvelopeTest(unittest.TestCase):
             self.assertEqual(payload["plan_action_count"], len(planned_actions))
             self.assertTrue(require_json_object_list(payload["applied_actions"], "applied_actions"))
             self.assertTrue(Path(str(payload["receipt_path"])).exists())
+
+    def test_cli_plan_allows_existing_symlink_parent_like_macos_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            real_parent = Path(tmp) / "private-tmp"
+            real_parent.mkdir()
+            symlink_parent = Path(tmp) / "tmp-link"
+            os.symlink(real_parent, symlink_parent, target_is_directory=True)
+            plan_path = symlink_parent / "plan.json"
+
+            exit_code, payload, stderr = run_cli_json(
+                ["--json", "--codex-home", str(stores.codex_home), "plan", "--out", str(plan_path)]
+            )
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual("", stderr)
+            self.assertTrue(plan_path.exists())
+            self.assertEqual(str(plan_path), payload["plan_path"])
+
+    def test_relative_codex_home_plan_is_bound_to_absolute_support_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan_cwd = root / "plan-cwd"
+            apply_cwd = root / "apply-cwd"
+            plan_cwd.mkdir()
+            apply_cwd.mkdir()
+            make_fixture(plan_cwd)
+            make_fixture(apply_cwd)
+            plan_path = root / "relative-plan.json"
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(plan_cwd)
+                exit_code, payload, stderr = run_cli_json(
+                    ["--json", "--codex-home", ".codex", "plan", "--out", str(plan_path)]
+                )
+                self.assertEqual(0, exit_code)
+                self.assertEqual("", stderr)
+                self.assertTrue(Path(str(payload["support_root"])).is_absolute())
+                self.assertTrue(str(payload["support_root"]).endswith("/plan-cwd/.codex"))
+                plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                self.assertEqual(str(payload["support_root"]), plan["support_root"])
+
+                os.chdir(apply_cwd)
+                exit_code, payload, stderr = run_cli_json(
+                    ["--json", "--codex-home", ".codex", "apply", "--plan", str(plan_path)]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual("", stderr)
+            self.assertEqual("support_root_mismatch", require_json_object(payload["error"], "error")["code"])
+            self.assertTrue(str(payload["support_root"]).endswith("/apply-cwd/.codex"))
+            self.assertNotEqual(str(plan["support_root"]), str(payload["support_root"]))
+            run_id = str(plan["run_id"])
+            plan_care = Path(str(plan["support_root"])) / "cdx-care"
+            apply_care = Path(str(payload["support_root"])) / "cdx-care"
+            self.assertFalse((plan_care / "backups" / run_id).exists())
+            self.assertFalse((plan_care / "receipts" / f"{run_id}.json").exists())
+            self.assertFalse((apply_care / "backups" / run_id).exists())
+            self.assertFalse((apply_care / "receipts" / f"{run_id}.json").exists())
 
     def test_cli_apply_and_run_failure_receipts_are_reported_in_json(self) -> None:
         def fail_git(_action: JsonObject) -> JsonObject:

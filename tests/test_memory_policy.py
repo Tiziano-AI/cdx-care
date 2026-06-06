@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
 from pathlib import Path
 
-from cdx_care_fixtures import first_action, make_fixture
+from cdx_care_fixtures import (
+    actions,
+    first_action,
+    insert_global_consolidation_job,
+    make_fixture,
+    remove_global_consolidation_job,
+    set_global_consolidation_job,
+    stat_snapshot,
+)
 
 from cdx_care.apply import apply_plan
 from cdx_care.errors import CdxCareError
@@ -72,7 +78,47 @@ class CdxCareMemoryPolicyTest(unittest.TestCase):
             self.assertEqual("action_target_denied", caught.exception.code)
             self.assertFalse((stores.care_root / "backups" / str(plan["run_id"])).exists())
 
-    def test_apply_denies_removed_memory_precondition(self) -> None:
+    def test_apply_denies_current_global_watermark_advanced_after_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            plan = generate_plan(stores, "workstation")
+            action = first_action(plan, "memory-global-consolidation-enqueue")
+            updates = action["updates"]
+            if not isinstance(updates, dict) or not isinstance(updates.get("input_watermark"), int):
+                raise AssertionError("input_watermark update must be an integer")
+            set_global_consolidation_job(
+                stores.db_path("memories"),
+                status="done",
+                worker_id=None,
+                ownership_token=None,
+                lease_until=None,
+                last_error=None,
+                input_watermark=int(updates["input_watermark"]),
+                last_success_watermark=10,
+            )
+            action["db_stat"] = stat_snapshot(stores.db_path("memories"))
+            plan["planned_actions"] = [action]
+
+            with self.assertRaises(CdxCareError) as caught:
+                apply_plan(stores, plan)
+
+            self.assertEqual("action_target_denied", caught.exception.code)
+            self.assertFalse((stores.care_root / "backups" / str(plan["run_id"])).exists())
+
+    def test_plan_omits_volatile_memory_watermark_preconditions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            plan = generate_plan(stores, "workstation")
+            action = first_action(plan, "memory-global-consolidation-enqueue")
+            preconditions = action["preconditions"]
+            if not isinstance(preconditions, list):
+                raise AssertionError("preconditions must be a list")
+            columns = {str(row.get("column")) for row in preconditions if isinstance(row, dict)}
+
+            self.assertNotIn("input_watermark", columns)
+            self.assertNotIn("last_success_watermark", columns)
+
+    def test_apply_denies_removed_required_memory_precondition(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stores = make_fixture(Path(tmp))
             plan = generate_plan(stores, "workstation")
@@ -83,7 +129,7 @@ class CdxCareMemoryPolicyTest(unittest.TestCase):
             action["preconditions"] = [
                 row
                 for row in preconditions
-                if isinstance(row, dict) and row.get("column") != "last_success_watermark"
+                if isinstance(row, dict) and row.get("column") != "retry_remaining"
             ]
 
             with self.assertRaises(CdxCareError) as caught:
@@ -205,63 +251,3 @@ class CdxCareMemoryPolicyTest(unittest.TestCase):
             action_ids = {str(action["id"]) for action in actions(second)}
 
             self.assertNotIn("memory-global-consolidation-enqueue", action_ids)
-
-
-def remove_global_consolidation_job(db_path: Path) -> None:
-    """Force the insert branch for global consolidation tests."""
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute("DELETE FROM jobs WHERE kind='memory_consolidate_global' AND job_key='global'")
-        conn.commit()
-
-
-def insert_global_consolidation_job(db_path: Path, *, status: str, input_watermark: int) -> None:
-    """Insert the native global memory row after an insert plan is created."""
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute(
-            """
-            INSERT INTO jobs
-            VALUES ('memory_consolidate_global', 'global', ?, NULL, NULL, NULL, NULL, NULL, NULL, 3,
-                    NULL, ?, 0)
-            """,
-            (status, input_watermark),
-        )
-        conn.commit()
-
-
-def set_global_consolidation_job(
-    db_path: Path,
-    *,
-    status: str,
-    worker_id: str | None,
-    ownership_token: str | None,
-    lease_until: int | None,
-    last_error: str | None,
-    input_watermark: int,
-    last_success_watermark: int,
-) -> None:
-    """Set the native global memory row to a precise planner state."""
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute(
-            """
-            UPDATE jobs
-            SET status=?, worker_id=?, ownership_token=?, lease_until=?, last_error=?,
-                input_watermark=?, last_success_watermark=?
-            WHERE kind='memory_consolidate_global' AND job_key='global'
-            """,
-            (status, worker_id, ownership_token, lease_until, last_error, input_watermark, last_success_watermark),
-        )
-        conn.commit()
-
-
-def stat_snapshot(path: Path) -> dict[str, object]:
-    """Mirror the public plan db_stat shape for tampered-plan tests."""
-    stat = path.stat()
-    return {"device": stat.st_dev, "inode": stat.st_ino, "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-
-def actions(plan: dict[str, object]) -> list[dict[str, object]]:
-    """Return planned actions as JSON objects."""
-    value = plan["planned_actions"]
-    if not isinstance(value, list):
-        raise AssertionError("planned_actions must be a list")
-    return [row for row in value if isinstance(row, dict)]

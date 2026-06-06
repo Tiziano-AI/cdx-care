@@ -39,6 +39,35 @@ def memories_report(stores: StorePaths) -> JsonObject:
                 {"count": jobs["stage1_terminal_error_count"], "categories": jobs["stage1_terminal_error_categories"]},
             )
         )
+    if jobs["stage1_auth_error_count"]:
+        findings.append(
+            finding(
+                "codex.memory.stage1_auth_errors",
+                "error",
+                (
+                    "Stage 1 memory jobs are failing on authentication; repair Codex/OpenAI credential "
+                    "loading before retry."
+                ),
+                {
+                    "count": jobs["stage1_auth_error_count"],
+                    "terminal_count": jobs["stage1_auth_terminal_error_count"],
+                    "retryable_count": jobs["stage1_auth_retryable_error_count"],
+                },
+            )
+        )
+    global_job = jobs.get("global_consolidation")
+    if isinstance(global_job, dict) and global_job.get("error_category") == "auth":
+        findings.append(
+            finding(
+                "codex.memory.global_auth_error",
+                "error",
+                (
+                    "Global memory consolidation is failing on authentication; repair Codex/OpenAI "
+                    "credential loading before enqueueing memory workers."
+                ),
+                {"status": str(global_job.get("status")), "retry_remaining": int(global_job.get("retry_remaining", 0))},
+            )
+        )
     artifacts = artifact_report(stores.memories_root)
     return {
         "data": {
@@ -69,15 +98,38 @@ def memory_jobs_report(conn: sqlite3.Connection) -> JsonObject:
         """
     ).fetchall()
     terminal_rows: list[JsonValue] = []
+    auth_rows: list[JsonValue] = []
     categories: Counter[str] = Counter()
+    all_categories: Counter[str] = Counter()
+    retryable_categories: Counter[str] = Counter()
+    auth_terminal_count = 0
+    auth_retryable_count = 0
     for row in error_rows:
+        retry_remaining = int(row["retry_remaining"])
         category = memory_error_category(str(row["last_error"] or ""))
-        if int(row["retry_remaining"]) <= 0:
+        all_categories[category] += 1
+        if retry_remaining > 0:
+            retryable_categories[category] += 1
+        if category == "auth":
+            if retry_remaining <= 0:
+                auth_terminal_count += 1
+            else:
+                auth_retryable_count += 1
+            auth_rows.append(
+                {
+                    "job_key": str(row["job_key"]),
+                    "retry_remaining": retry_remaining,
+                    "error_category": category,
+                    "started_at": int(row["started_at"] or 0),
+                    "finished_at": int(row["finished_at"] or 0),
+                }
+            )
+        if retry_remaining <= 0:
             categories[category] += 1
             terminal_rows.append(
                 {
                     "job_key": str(row["job_key"]),
-                    "retry_remaining": int(row["retry_remaining"]),
+                    "retry_remaining": retry_remaining,
                     "error_category": category,
                     "started_at": int(row["started_at"] or 0),
                     "finished_at": int(row["finished_at"] or 0),
@@ -85,13 +137,22 @@ def memory_jobs_report(conn: sqlite3.Connection) -> JsonObject:
             )
     global_data = memory_global_job_report(conn)
     returned_terminal_rows = terminal_rows[:ROW_LIMIT]
+    returned_auth_rows = auth_rows[:ROW_LIMIT]
     return {
         "by_status_kind": by_status_kind,
         "stage1_error_count": len(error_rows),
+        "stage1_error_categories": dict(sorted(all_categories.items())),
+        "stage1_retryable_error_count": sum(retryable_categories.values()),
+        "stage1_retryable_error_categories": dict(sorted(retryable_categories.items())),
         "stage1_terminal_error_count": len(terminal_rows),
         "stage1_terminal_error_categories": dict(sorted(categories.items())),
         "stage1_terminal_error_rows": returned_terminal_rows,
         "stage1_terminal_error_rows_meta": collection_metadata(len(terminal_rows), len(returned_terminal_rows)),
+        "stage1_auth_error_count": len(auth_rows),
+        "stage1_auth_terminal_error_count": auth_terminal_count,
+        "stage1_auth_retryable_error_count": auth_retryable_count,
+        "stage1_auth_error_rows": returned_auth_rows,
+        "stage1_auth_error_rows_meta": collection_metadata(len(auth_rows), len(returned_auth_rows)),
         "global_consolidation": global_data,
     }
 
@@ -118,12 +179,28 @@ def memory_global_job_report(conn: sqlite3.Connection) -> JsonObject | None:
         "lease_until": int(global_row["lease_until"] or 0),
         "retry_at": int(global_row["retry_at"] or 0),
         "last_error_present": global_row["last_error"] is not None,
+        "error_category": memory_error_category(str(global_row["last_error"] or ""))
+        if global_row["last_error"] is not None
+        else None,
     }
 
 
 def memory_error_category(error: str) -> str:
     """Categorize a memory error without returning the raw body."""
     lower = error.lower()
+    if (
+        "401" in lower
+        or "unauthorized" in lower
+        or "authentication" in lower
+        or "missing bearer" in lower
+        or "basic authentication" in lower
+        or "invalid api key" in lower
+        or "api key" in lower
+        or "credential" in lower
+        or "credentials" in lower
+        or "bearer token" in lower
+    ):
+        return "auth"
     if "context" in lower or "token" in lower:
         return "context_or_tokens"
     if "max output" in lower or "output" in lower:

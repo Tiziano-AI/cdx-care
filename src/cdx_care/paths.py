@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,4 +68,4 @@ def default_codex_home() -> Path:
 def store_paths(codex_home: str | None) -> StorePaths:
     """Resolve a user supplied Codex home or the default."""
     root = Path(codex_home).expanduser() if codex_home else default_codex_home()
-    return StorePaths(root)
+    return StorePaths(Path(os.path.abspath(os.fspath(root))))

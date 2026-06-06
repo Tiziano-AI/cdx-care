@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 from contextlib import closing
@@ -45,8 +46,18 @@ def make_fixture(root: Path) -> StorePaths:
     create_logs_db(stores.db_path("logs"))
     create_empty_db(stores.db_path("goals"))
     create_memory_git(stores.memories_root)
-    stores.session_index.write_text('{"id":"thread-good"}\n{"id":"thread-index-only"}\n', encoding="utf-8")
-    stores.history.write_text('{"session_id":"thread-good","text":"private","ts":1}\n', encoding="utf-8")
+    create_session_rollouts(stores.codex_home)
+    stores.session_index.write_text(
+        '{"id":"thread-good","thread_name":"stale","updated_at":"2020-01-01T00:00:00.000000Z"}\n'
+        '{"id":"thread-default","thread_name":"legacy fallback","updated_at":"2020-01-01T00:00:00.000000Z"}\n'
+        '{"id":"thread-index-only","thread_name":"orphan","updated_at":"2020-01-01T00:00:00.000000Z"}\n',
+        encoding="utf-8",
+    )
+    stores.history.write_text(
+        '{"session_id":"thread-good","text":"private","ts":1}\n'
+        '{"session_id":"thread-history-orphan","text":"private orphan","ts":2}\n',
+        encoding="utf-8",
+    )
     return stores
 
 
@@ -58,10 +69,23 @@ def create_state_db(path: Path) -> None:
             CREATE TABLE threads (
               id TEXT PRIMARY KEY,
               rollout_path TEXT,
-              has_user_event INTEGER
+              has_user_event INTEGER,
+              title TEXT,
+              first_user_message TEXT,
+              updated_at_ms INTEGER
             );
-            INSERT INTO threads(id, rollout_path, has_user_event)
-            VALUES ('thread-good', 'sessions/rollout-thread-good.jsonl', 1);
+            INSERT INTO threads(id, rollout_path, has_user_event, title, first_user_message, updated_at_ms)
+            VALUES ('thread-good', 'sessions/2026/01/01/rollout-thread-good.jsonl', 1, 'valid', 'first good', 1000);
+            INSERT INTO threads(id, rollout_path, has_user_event, title, first_user_message, updated_at_ms)
+            VALUES (
+              'thread-default', 'sessions/2026/01/01/rollout-thread-default.jsonl', 1,
+              'same text', 'same text', 1500
+            );
+            INSERT INTO threads(id, rollout_path, has_user_event, title, first_user_message, updated_at_ms)
+            VALUES (
+              'thread-accepted', 'sessions/2026/01/01/rollout-thread-accepted.jsonl', 1,
+              'accepted', 'first accepted', 2000
+            );
             """
         )
 
@@ -95,6 +119,8 @@ def create_codex_dev_db(path: Path) -> None:
             );
             INSERT INTO automation_runs
             VALUES ('thread-good', 'auto-good', 'PENDING_REVIEW', NULL, 'valid', 10, 20);
+            INSERT INTO automation_runs
+            VALUES ('thread-accepted', 'auto-good', 'ACCEPTED', NULL, 'accepted', 10, 23);
             INSERT INTO automation_runs
             VALUES ('thread-archived', 'auto-good', 'ARCHIVED', NULL, 'archived', 11, 21);
             INSERT INTO automation_runs
@@ -152,6 +178,7 @@ def create_memories_db(path: Path) -> None:
 def create_logs_db(path: Path) -> None:
     """Create a minimal logs DB."""
     with closing(sqlite3.connect(path)) as conn:
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.executescript(
             """
             CREATE TABLE logs (
@@ -162,6 +189,13 @@ def create_logs_db(path: Path) -> None:
             INSERT INTO logs(level, feedback_log_body) VALUES ('INFO', 'private');
             """
         )
+        for index in range(20):
+            conn.execute(
+                "INSERT INTO logs(level, feedback_log_body) VALUES ('DEBUG', ?)",
+                ("x" * 20_000 if index % 2 == 0 else "y" * 20_000,),
+            )
+        conn.execute("DELETE FROM logs WHERE level='DEBUG'")
+        conn.commit()
 
 
 def create_empty_db(path: Path) -> None:
@@ -178,7 +212,32 @@ def create_memory_git(path: Path) -> None:
     (path / ".DS_Store").write_text("finder", encoding="utf-8")
     (path / "extensions" / ".DS_Store").write_text("finder", encoding="utf-8")
     run(["git", "init", str(path)])
-    run(["git", "-C", str(path), "add", "-f", ".DS_Store", "extensions/.DS_Store"])
+    run(["git", "-C", str(path), "add", "-f", ".gitignore", ".DS_Store", "extensions/.DS_Store"])
+    run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.name=cdx-care-fixture",
+            "-c",
+            "user.email=cdx-care-fixture@local.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "Initialize fixture memory repo",
+        ]
+    )
+
+
+def create_session_rollouts(codex_home: Path) -> None:
+    """Create rollout files whose session_meta rows prove state thread IDs."""
+    root = codex_home / "sessions" / "2026" / "01" / "01"
+    root.mkdir(parents=True)
+    for thread_id in ("thread-good", "thread-default", "thread-accepted"):
+        row = {"type": "session_meta", "payload": {"id": thread_id}}
+        (root / f"rollout-{thread_id}.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
 
 
 def run(args: list[str]) -> None:
@@ -196,3 +255,78 @@ def fake_lsof_handles(_paths: list[Path]) -> tuple[bool, list[JsonObject]]:
 def fake_lsof_unavailable(_paths: list[Path]) -> tuple[bool, list[JsonObject]]:
     """Pretend lsof cannot provide a reliable handle proof."""
     return False, []
+
+
+def remove_global_consolidation_job(db_path: Path) -> None:
+    """Force the insert branch for global consolidation tests."""
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("DELETE FROM jobs WHERE kind='memory_consolidate_global' AND job_key='global'")
+        conn.commit()
+
+
+def insert_global_consolidation_job(db_path: Path, *, status: str, input_watermark: int) -> None:
+    """Insert the native global memory row after an insert plan is created."""
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs
+            VALUES ('memory_consolidate_global', 'global', ?, NULL, NULL, NULL, NULL, NULL, NULL, 3,
+                    NULL, ?, 0)
+            """,
+            (status, input_watermark),
+        )
+        conn.commit()
+
+
+def set_global_consolidation_job(
+    db_path: Path,
+    *,
+    status: str,
+    worker_id: str | None,
+    ownership_token: str | None,
+    lease_until: int | None,
+    last_error: str | None,
+    input_watermark: int,
+    last_success_watermark: int,
+) -> None:
+    """Set the native global memory row to a precise planner state."""
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status=?, worker_id=?, ownership_token=?, lease_until=?, last_error=?,
+                input_watermark=?, last_success_watermark=?
+            WHERE kind='memory_consolidate_global' AND job_key='global'
+            """,
+            (status, worker_id, ownership_token, lease_until, last_error, input_watermark, last_success_watermark),
+        )
+        conn.commit()
+
+
+def set_stage1_error(db_path: Path, *, job_key: str, last_error: str, retry_remaining: int) -> None:
+    """Set one Stage 1 job error for planner tests."""
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status='error', last_error=?, retry_remaining=?, worker_id=NULL, ownership_token=NULL,
+                started_at=100, finished_at=200, lease_until=0, retry_at=NULL
+            WHERE kind='memory_stage1' AND job_key=?
+            """,
+            (last_error, retry_remaining, job_key),
+        )
+        conn.commit()
+
+
+def stat_snapshot(path: Path) -> dict[str, object]:
+    """Mirror the public plan db_stat shape for tampered-plan tests."""
+    stat = path.stat()
+    return {"device": stat.st_dev, "inode": stat.st_ino, "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def actions(plan: dict[str, object]) -> list[dict[str, object]]:
+    """Return planned actions as JSON objects."""
+    value = plan["planned_actions"]
+    if not isinstance(value, list):
+        raise AssertionError("planned_actions must be a list")
+    return [row for row in value if isinstance(row, dict)]

@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 
 from cdx_care.errors import CdxCareError
-from cdx_care.policy import ApplyContext, verify_lane_eligibility
+from cdx_care.policy import ApplyContext, verify_lane_eligibility, verify_memory_auth_blockers
 from cdx_care.policy_checks import action_schema_tables, normalized_path, object_map
 from cdx_care.sqlite_tools import (
     connect_readonly,
@@ -110,6 +110,7 @@ def apply_sqlite_update(conn: sqlite3.Connection, action: JsonObject, context: A
     table = str(action["table"])
     key = object_map(action.get("key"), "key")
     preconditions = precondition_list(action.get("preconditions"))
+    verify_memory_auth_blockers(conn, action)
     row = fetch_one_by_key(conn, table, key)
     verify_lane_eligibility(row, action, context)
     verify_preconditions(row, preconditions)
@@ -140,6 +141,7 @@ def apply_sqlite_insert(conn: sqlite3.Connection, action: JsonObject, context: A
     """Insert one row with readback."""
     table = str(action["table"])
     values = object_map(action.get("values"), "values")
+    verify_memory_auth_blockers(conn, action)
     verify_absence_precondition(conn, action)
     verify_memory_global_insert_watermark(conn, action, values, context)
     columns = list(values)
@@ -183,6 +185,7 @@ def preflight_db_action(conn: sqlite3.Connection, action: JsonObject, context: A
     if action_type == "sqlite_update":
         table = str(action["table"])
         key = object_map(action.get("key"), "key")
+        verify_memory_auth_blockers(conn, action)
         row = fetch_one_by_key(conn, table, key)
         verify_lane_eligibility(row, action, context)
         verify_preconditions(row, precondition_list(action.get("preconditions")))
@@ -191,6 +194,7 @@ def preflight_db_action(conn: sqlite3.Connection, action: JsonObject, context: A
         return
     if action_type == "sqlite_insert":
         values = object_map(action.get("values"), "values")
+        verify_memory_auth_blockers(conn, action)
         verify_absence_precondition(conn, action)
         verify_memory_global_insert_watermark(conn, action, values, context)
         return

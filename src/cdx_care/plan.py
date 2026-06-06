@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import uuid
 from contextlib import closing
 from pathlib import Path
@@ -13,30 +12,49 @@ from cdx_care import VERSION
 from cdx_care.doctor import load_state_thread_ids_checked
 from cdx_care.errors import CdxCareError
 from cdx_care.filesystem import ensure_parent_dir
-from cdx_care.git_tools import tracked_paths
-from cdx_care.memory_reports import memory_error_category
+from cdx_care.git_tools import head_tracked_paths, tracked_paths
+from cdx_care.logs_compact import LOG_COMPACT_MIN_RECLAIMABLE_BYTES, logs_physical_report, logs_schema_fingerprint
+from cdx_care.memory_plan import plan_memory_actions
 from cdx_care.paths import StorePaths
-from cdx_care.plan_actions import sqlite_insert_action, sqlite_update_action
+from cdx_care.plan_actions import sqlite_update_action
 from cdx_care.processes import existing_lsof_targets, lsof_handles
-from cdx_care.sqlite_tools import connect_readonly, schema_fingerprint, table_names, value_hash
-from cdx_care.timeutil import epoch_ms, epoch_seconds, iso_now
+from cdx_care.session_repair import (
+    desired_session_index_bytes,
+    file_sha256_or_none,
+    file_stat,
+    jsonl_id_set,
+    sha256_bytes,
+    state_source_stat,
+    verify_session_file_alignment,
+)
+from cdx_care.sqlite_tools import connect_readonly, schema_fingerprint, table_names
+from cdx_care.timeutil import epoch_ms, iso_now
 from cdx_care.types import JsonObject, JsonValue
 
-DEFAULT_STAGE1_RETRY_REMAINING = 3
+PROFILE_WORKSTATION = "workstation"
+PROFILE_CLEAR_CURRENT_BADGE = "clear-current-badge"
+SUPPORTED_PROFILES = {PROFILE_WORKSTATION, PROFILE_CLEAR_CURRENT_BADGE}
 
 
 def generate_plan(stores: StorePaths, profile: str) -> JsonObject:
     """Generate a workstation reconciliation plan."""
+    if profile not in SUPPORTED_PROFILES:
+        raise CdxCareError(f"unsupported profile: {profile}", code="unsupported_profile")
     run_id = str(uuid.uuid4())
     planned_at = iso_now()
     actions: list[JsonValue] = []
     denials: list[JsonValue] = []
-    codex_dev_actions, codex_dev_denials = plan_codex_dev_actions(stores, planned_at)
+    clear_current_badge = profile == PROFILE_CLEAR_CURRENT_BADGE
+    codex_dev_actions, codex_dev_denials = plan_codex_dev_actions(stores, planned_at, clear_current_badge)
     actions.extend(codex_dev_actions)
     denials.extend(codex_dev_denials)
     memory_actions, memory_denials = plan_memory_actions(stores, planned_at)
     actions.extend(memory_actions)
     denials.extend(memory_denials)
+    session_actions, session_denials = plan_session_file_actions(stores)
+    actions.extend(session_actions)
+    denials.extend(session_denials)
+    actions.extend(plan_logs_compaction_actions(stores))
     actions.extend(plan_git_hygiene_actions(stores))
     db_paths = list(stores.db_paths().values())
     lsof_available, handles = lsof_handles(db_paths)
@@ -52,12 +70,19 @@ def generate_plan(stores: StorePaths, profile: str) -> JsonObject:
         "support_root": str(stores.codex_home),
         "codex_closed": lsof_available and lsof_target_count > 0 and not handles,
         "lsof": {"available": lsof_available, "target_count": lsof_target_count, "handle_count": len(handles)},
-        "approved_policy": "workstation-hide-broken-only",
+        "approved_policy": approved_policy_name(profile),
         "planned_actions": actions,
         "action_count": len(actions),
         "denials": denials,
     }
     return plan
+
+
+def approved_policy_name(profile: str) -> str:
+    """Return the explicit closed-policy label for a profile."""
+    if profile == PROFILE_CLEAR_CURRENT_BADGE:
+        return "manual-clear-current-badge"
+    return "workstation-hide-broken-only"
 
 
 def write_plan(plan: JsonObject, out_path: Path) -> None:
@@ -75,7 +100,9 @@ def write_new_text(path: Path, text: str, *, mode: int) -> None:
         handle.write(text)
 
 
-def plan_codex_dev_actions(stores: StorePaths, planned_at: str) -> tuple[list[JsonValue], list[JsonValue]]:
+def plan_codex_dev_actions(
+    stores: StorePaths, planned_at: str, clear_current_badge: bool
+) -> tuple[list[JsonValue], list[JsonValue]]:
     """Plan safe app DB read-state repairs."""
     path = stores.db_path("codex-dev")
     if not path.exists():
@@ -105,23 +132,39 @@ def plan_codex_dev_actions(stores: StorePaths, planned_at: str) -> tuple[list[Js
             for row in rows:
                 thread_id = str(row["thread_id"])
                 status = str(row["status"])
+                automation_id = str(row["automation_id"])
                 if status == "ARCHIVED" or thread_id not in state_ids:
                     actions.append(
-                        sqlite_update_action(
-                            action_id=f"automation-run-mark-read:{thread_id}:{row['automation_id']}",
+                        automation_mark_read_action(
+                            action_id=f"automation-run-mark-read:{thread_id}:{automation_id}",
                             lane="automations.hide_broken_only",
-                            db_name="codex-dev",
-                            db_path=path,
-                            schema_fingerprint_value=fingerprint,
-                            table="automation_runs",
-                            key={"thread_id": thread_id, "automation_id": str(row["automation_id"])},
-                            preconditions=[
-                                {"column": "status", "equals": status},
-                                {"column": "read_at", "is_null": True},
-                                {"column": "updated_at", "equals": int(row["updated_at"])},
-                            ],
-                            updates={"read_at": read_at},
+                            path=path,
+                            fingerprint=fingerprint,
+                            thread_id=thread_id,
+                            automation_id=automation_id,
+                            status=status,
+                            updated_at=int(row["updated_at"]),
+                            read_at=read_at,
                             description="Mark a non-actionable unread automation run as read.",
+                        )
+                    )
+                elif clear_current_badge and status in {"PENDING_REVIEW", "ACCEPTED"}:
+                    actions.append(
+                        automation_mark_read_action(
+                            action_id=f"automation-run-clear-badge:{thread_id}:{automation_id}",
+                            lane="automations.clear_current_badge",
+                            path=path,
+                            fingerprint=fingerprint,
+                            thread_id=thread_id,
+                            automation_id=automation_id,
+                            status=status,
+                            updated_at=int(row["updated_at"]),
+                            read_at=read_at,
+                            description=(
+                                "Explicitly mark a navigable unread automation review run as read "
+                                "to clear the current app badge."
+                            ),
+                            extra={"manual_profile": PROFILE_CLEAR_CURRENT_BADGE},
                         )
                     )
         if "inbox_items" in tables:
@@ -154,215 +197,45 @@ def plan_codex_dev_actions(stores: StorePaths, planned_at: str) -> tuple[list[Js
     return actions, []
 
 
-def plan_memory_actions(stores: StorePaths, planned_at: str) -> tuple[list[JsonValue], list[JsonValue]]:
-    """Plan memory retry and native phase-2 enqueue repairs."""
-    path = stores.db_path("memories")
-    if not path.exists():
-        return [], []
-    actions: list[JsonValue] = []
-    denials: list[JsonValue] = []
-    now = epoch_seconds()
-    with closing(connect_readonly(path)) as conn:
-        tables = table_names(conn)
-        if "jobs" not in tables:
-            return [], []
-        fingerprint = schema_fingerprint(conn, [table for table in ("jobs", "stage1_outputs") if table in tables])
-        memory_schema_tables = [table for table in ("jobs", "stage1_outputs") if table in tables]
-        stage1_rows = conn.execute(
-            """
-            SELECT kind, job_key, status, worker_id, ownership_token, started_at, finished_at,
-                   lease_until, retry_at, retry_remaining, last_error, input_watermark, last_success_watermark
-            FROM jobs
-            WHERE kind='memory_stage1' AND status='error' AND retry_remaining <= 0
-            ORDER BY finished_at, job_key
-            """
-        ).fetchall()
-        for row in stage1_rows:
-            if has_future_lease(row, now):
-                denials.append(
-                    {
-                        "code": "memory.stage1_retry.active_lease",
-                        "job_key": str(row["job_key"]),
-                        "reason": "job has worker, ownership token, or a future lease",
-                    }
-                )
-                continue
-            last_error = row["last_error"]
-            actions.append(
-                sqlite_update_action(
-                    action_id=f"memory-stage1-retry:{row['job_key']}",
-                    lane="memory.stage1_retry_terminal_errors",
-                    db_name="memories",
-                    db_path=path,
-                    schema_fingerprint_value=fingerprint,
-                    table="jobs",
-                    key={"kind": "memory_stage1", "job_key": str(row["job_key"])},
-                    preconditions=[
-                        {"column": "status", "equals": "error"},
-                        {"column": "worker_id", "sha256": value_hash(row["worker_id"])},
-                        {"column": "ownership_token", "sha256": value_hash(row["ownership_token"])},
-                        {"column": "started_at", "equals": row["started_at"]},
-                        {"column": "finished_at", "equals": row["finished_at"]},
-                        {"column": "lease_until", "equals": row["lease_until"]},
-                        {"column": "retry_at", "equals": row["retry_at"]},
-                        {"column": "retry_remaining", "equals": int(row["retry_remaining"])},
-                        {"column": "last_error", "sha256": value_hash(last_error)},
-                        {"column": "input_watermark", "equals": int(row["input_watermark"] or 0)},
-                        {
-                            "column": "last_success_watermark",
-                            "equals": int(row["last_success_watermark"] or 0),
-                        },
-                    ],
-                    updates={
-                        "status": "pending",
-                        "worker_id": None,
-                        "ownership_token": None,
-                        "started_at": None,
-                        "finished_at": None,
-                        "lease_until": None,
-                        "retry_at": None,
-                        "retry_remaining": DEFAULT_STAGE1_RETRY_REMAINING,
-                        "last_error": None,
-                    },
-                    description="Reset a terminal Stage 1 memory error job to claimable pending state.",
-                    extra={
-                        "previous_error_category": memory_error_category(str(last_error or "")),
-                        "previous_error_sha256": value_hash(last_error),
-                    },
-                )
-            )
-            if isinstance(actions[-1], dict):
-                actions[-1]["schema_tables"] = memory_schema_tables
-        global_actions, global_denials = plan_global_consolidation(
-            conn, path, fingerprint, now, memory_schema_tables, bool(actions)
-        )
-        actions.extend(global_actions)
-        denials.extend(global_denials)
-    _ = planned_at
-    return actions, denials
-
-
-def has_future_lease(row: sqlite3.Row, now: int) -> bool:
-    """Return whether a memory job row still has a live future lease."""
-    lease_until = int(row["lease_until"] or 0)
-    return lease_until > now
-
-
-def plan_global_consolidation(
-    conn: sqlite3.Connection,
+def automation_mark_read_action(
+    *,
+    action_id: str,
+    lane: str,
     path: Path,
     fingerprint: str,
-    now: int,
-    schema_tables: list[str],
-    force_due_to_stage1_retry: bool,
-) -> tuple[list[JsonValue], list[JsonValue]]:
-    """Plan a native global memory consolidation enqueue/reset."""
-    max_source = 0
-    if "stage1_outputs" in table_names(conn):
-        row = conn.execute("SELECT MAX(source_updated_at) FROM stage1_outputs").fetchone()
-        max_source = int(row[0] or 0) if row else 0
-    current = conn.execute(
-        """
-        SELECT kind, job_key, status, worker_id, ownership_token, started_at, finished_at,
-               lease_until, retry_at, retry_remaining, last_error, input_watermark, last_success_watermark
-        FROM jobs
-        WHERE kind='memory_consolidate_global' AND job_key='global'
-        """
-    ).fetchone()
-    if current is None:
-        action = sqlite_insert_action(
-            action_id="memory-global-consolidation-insert",
-            lane="memory.force_global_consolidation",
-            db_name="memories",
-            db_path=path,
-            schema_fingerprint_value=fingerprint,
-            table="jobs",
-            values={
-                "kind": "memory_consolidate_global",
-                "job_key": "global",
-                "status": "pending",
-                "worker_id": None,
-                "ownership_token": None,
-                "started_at": None,
-                "finished_at": None,
-                "lease_until": None,
-                "retry_at": None,
-                "retry_remaining": DEFAULT_STAGE1_RETRY_REMAINING,
-                "last_error": None,
-                "input_watermark": max(max_source, now),
-                "last_success_watermark": 0,
-            },
-            description="Create the native global memory consolidation job as pending.",
-        )
-        action["schema_tables"] = schema_tables
-        return [action], []
-    current_input = int(current["input_watermark"] or 0)
-    last_success = int(current["last_success_watermark"] or 0)
-    lease_until = int(current["lease_until"] or 0)
-    if lease_until > now:
-        return [], [
-            {
-                "code": "memory.global_consolidation.active_lease",
-                "reason": "native global memory consolidation job has a future lease",
-            }
-        ]
-    if (
-        str(current["status"]) == "pending"
-        and current["last_error"] is None
-        and current["worker_id"] is None
-        and current["ownership_token"] is None
-        and current_input >= max(max_source, last_success)
-    ):
-        return [], []
-    needs_consolidation = force_due_to_stage1_retry or str(current["status"]) != "done" or last_success < max_source
-    if not needs_consolidation:
-        return [], []
-    target_watermark = max(current_input + 1, max_source, now)
-    action = sqlite_update_action(
-        action_id="memory-global-consolidation-enqueue",
-        lane="memory.force_global_consolidation",
-        db_name="memories",
+    thread_id: str,
+    automation_id: str,
+    status: str,
+    updated_at: int,
+    read_at: int,
+    description: str,
+    extra: JsonObject | None = None,
+) -> JsonObject:
+    """Build an admitted automation_runs mark-read action."""
+    return sqlite_update_action(
+        action_id=action_id,
+        lane=lane,
+        db_name="codex-dev",
         db_path=path,
         schema_fingerprint_value=fingerprint,
-        table="jobs",
-        key={"kind": "memory_consolidate_global", "job_key": "global"},
+        table="automation_runs",
+        key={"thread_id": thread_id, "automation_id": automation_id},
         preconditions=[
-            {"column": "status", "equals": str(current["status"])},
-            {"column": "worker_id", "sha256": value_hash(current["worker_id"])},
-            {"column": "ownership_token", "sha256": value_hash(current["ownership_token"])},
-            {"column": "started_at", "equals": current["started_at"]},
-            {"column": "finished_at", "equals": current["finished_at"]},
-            {"column": "lease_until", "equals": current["lease_until"]},
-            {"column": "retry_at", "equals": current["retry_at"]},
-            {"column": "retry_remaining", "equals": int(current["retry_remaining"])},
-            {"column": "input_watermark", "equals": current_input},
-            {"column": "last_success_watermark", "equals": last_success},
-            {"column": "last_error", "sha256": value_hash(current["last_error"])},
+            {"column": "status", "equals": status},
+            {"column": "read_at", "is_null": True},
+            {"column": "updated_at", "equals": updated_at},
         ],
-        updates={
-            "status": "pending",
-            "worker_id": None,
-            "ownership_token": None,
-            "started_at": None,
-            "finished_at": None,
-            "lease_until": None,
-            "retry_at": None,
-            "retry_remaining": DEFAULT_STAGE1_RETRY_REMAINING,
-            "last_error": None,
-            "input_watermark": target_watermark,
-        },
-        description="Enqueue the native global memory consolidation job.",
-        extra={"previous_error_sha256": value_hash(current["last_error"])},
+        updates={"read_at": read_at},
+        description=description,
+        extra=extra,
     )
-    action["schema_tables"] = schema_tables
-    return [action], []
 
 
 def plan_git_hygiene_actions(stores: StorePaths) -> list[JsonValue]:
     """Plan memory git .DS_Store untracking."""
     repo = stores.memories_root
     targets = [".DS_Store", "extensions/.DS_Store"]
-    tracked = tracked_paths(repo, targets)
+    tracked = sorted(set(tracked_paths(repo, targets)) | set(head_tracked_paths(repo, targets)))
     if not tracked:
         return []
     return [
@@ -375,5 +248,119 @@ def plan_git_hygiene_actions(stores: StorePaths) -> list[JsonValue]:
             ),
             "repo": str(repo),
             "paths": tracked,
+            "commit": True,
+            "commit_message": "Untrack Codex memory Finder metadata",
         }
     ]
+
+
+def plan_session_file_actions(stores: StorePaths) -> tuple[list[JsonValue], list[JsonValue]]:
+    """Plan deterministic session_index JSONL repair."""
+    state_db = stores.db_path("state")
+    if not state_db.exists():
+        return [], [
+            {
+                "code": "sessions.state_threads.unavailable",
+                "reason": "state_5.sqlite is missing; refusing session/history file repair planning",
+            }
+        ]
+    alignment = verify_session_file_alignment(state_db, stores.codex_home / "sessions")
+    if alignment["state_not_in_session_file_ids"] or alignment["session_file_ids_not_in_state"]:
+        return [], [
+            {
+                "code": "sessions.rollout_alignment_drift",
+                "reason": (
+                    "state thread IDs and rollout files differ; refusing JSONL repair until the owner is reviewed"
+                ),
+                "details": alignment,
+            }
+        ]
+    actions: list[JsonValue] = []
+    try:
+        source = state_source_stat(state_db)
+        index_bytes, index_count = desired_session_index_bytes(state_db, stores.session_index)
+    except CdxCareError as error:
+        return [], [{"code": error.code, "reason": str(error)}]
+    index_sha = sha256_bytes(index_bytes)
+    current_index_sha = file_sha256_or_none(stores.session_index)
+    index_ids = jsonl_id_set(stores.session_index, "id")
+    desired_ids = jsonl_id_set_from_bytes(index_bytes, "id")
+    if current_index_sha != index_sha or index_ids != desired_ids:
+        actions.append(
+            {
+                "id": "sessions-rebuild-session-index",
+                "type": "jsonl_rewrite",
+                "lane": "sessions.rebuild_session_index",
+                "description": "Rebuild session_index.jsonl from state_5.threads and rollout-file proof.",
+                "path": str(stores.session_index),
+                "source_db": "state",
+                "source_db_path": str(state_db),
+                "source": source,
+                "target_stat": file_stat(stores.session_index),
+                "desired_sha256": index_sha,
+                "desired_bytes": len(index_bytes),
+                "desired_row_count": index_count,
+                "privacy": {"plan_contains_private_text": False, "content_recomputed_at_apply": True},
+                "alignment": alignment,
+            }
+        )
+    return actions, []
+
+
+def jsonl_id_set_from_bytes(content: bytes, key: str) -> set[str]:
+    """Collect a top-level string ID key from generated JSONL bytes."""
+    ids: set[str] = set()
+    for line in content.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            value = payload.get(key)
+            if isinstance(value, str):
+                ids.add(value)
+    return ids
+
+
+def plan_logs_compaction_actions(stores: StorePaths) -> list[JsonValue]:
+    """Plan logs DB compaction when SQLite freelist pages are reclaimable."""
+    path = stores.db_path("logs")
+    if not path.exists():
+        return []
+    report = logs_physical_report(path)
+    reclaimable = report.get("reclaimable_bytes")
+    if not isinstance(reclaimable, int) or reclaimable < LOG_COMPACT_MIN_RECLAIMABLE_BYTES:
+        return []
+    fingerprint, tables = logs_schema_fingerprint(path)
+    return [
+        {
+            "id": "logs-compact-freelist",
+            "type": "sqlite_compact",
+            "lane": "logs.compact_freelist",
+            "description": "Compact logs_2.sqlite with VACUUM after DB-family backup; no log rows are deleted.",
+            "db": "logs",
+            "db_path": str(path),
+            "db_stat": db_stat_for_path(path),
+            "schema_fingerprint": fingerprint,
+            "schema_tables": tables,
+            "method": "vacuum",
+            "page_size": report["page_size"],
+            "page_count": report["page_count"],
+            "freelist_count": report["freelist_count"],
+            "reclaimable_bytes": reclaimable,
+            "row_count": report["row_count"],
+            "privacy": {"plan_contains_log_bodies": False},
+        }
+    ]
+
+
+def db_stat_for_path(path: Path) -> JsonObject:
+    """Return DB stat snapshot for non-row DB actions."""
+    stat = path.stat()
+    return {
+        "exists": True,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }

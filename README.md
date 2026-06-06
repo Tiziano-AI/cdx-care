@@ -10,8 +10,9 @@ guarded reconciliation of DB/state drift without editing vendor Codex source.
   Codex DBs.
 - `apply` and `run --apply-approved` deny DB writes when Codex has live handles
   open on the target DBs.
-- Every DB write is planned first with exact keys, schema fingerprint, old-value
-  preconditions, backup of DB/WAL/SHM, transaction, readback, and a receipt.
+- Every row-level DB write is planned first with exact keys, schema fingerprint,
+  old-value preconditions, backup of DB/WAL/SHM, transaction, readback, and a
+  receipt.
 - Plan files are untrusted input at apply time: action DB paths, lanes, tables,
   schema table sets, update/insert columns, git repo, git paths, and `run_id`
   are revalidated against the closed v1 policy.
@@ -24,8 +25,15 @@ guarded reconciliation of DB/state drift without editing vendor Codex source.
 - Managed `~/.codex/cdx-care/**` artifact directories for generated run plans,
   backups, and receipts are forced to `0700`; plan, backup, and receipt files
   are created `0600`.
-- Session/history reindex is diagnostic-only in v1.
-- Log DB compaction is diagnostic-only in v1.
+- Session repair writes only the legacy `session_index.jsonl` name index after
+  state/rollout-file alignment proof. It replaces distinct `state_5.sqlite`
+  titles and preserves current latest-entry fallback names for threads whose
+  SQLite title is still blank/default. `history.jsonl` is append-only message
+  history and remains diagnostic-only.
+- Memory git hygiene runs the admitted `.DS_Store` commit with Git hooks and
+  global/system config disabled; the lane must not execute ambient repo hooks.
+- Log DB compaction is a guarded standalone `VACUUM` lane after DB-family
+  backup, disk-space preflight, integrity/schema checks, and row-count readback.
 
 ## Commands
 
@@ -34,6 +42,7 @@ cdx-care --json doctor
 cdx-care --json plan --profile workstation --out /tmp/cdx-care-plan.json
 cdx-care --json apply --plan /tmp/cdx-care-plan.json
 cdx-care --json run --profile workstation --apply-approved
+cdx-care --json plan --profile clear-current-badge --out /tmp/cdx-care-clear-badge-plan.json
 cdx-care --json diagnose blank-page --out-dir /tmp/cdx-care-blank-page-new
 cdx-care --json raw sql --db codex-dev --query-file query.sql --readonly
 ```
@@ -45,21 +54,37 @@ you need bounded row lists or raw `lsof` handle rows. `run --apply-approved` is
 only the no-interactive-review shortcut for the already approved workstation
 policy; it still writes the generated plan and runs the same apply gates.
 
+`workstation` is conservative: it hides broken/non-navigable unread rows but
+keeps valid automation review rows unread. If the desired user-visible outcome
+is “clear the current automation badge”, use the explicit
+`clear-current-badge` profile after reviewing that it will mark valid
+`PENDING_REVIEW`/`ACCEPTED` run instances as read. `run --profile
+clear-current-badge --apply-approved` is denied on purpose; generate the plan,
+inspect it, then apply that exact plan.
+
 All JSON success/error responses include at least `schema_version`, `tool`,
 `version`, and `ok`. State-aware commands also include `support_root`, and
 write commands include the generated/applied action lists plus the receipt path.
 
 ## Current v1 lanes
 
-- Automations/badge: report unread run-instance count, preserve valid
-  `PENDING_REVIEW` runs, and mark read only broken/non-navigable rows by
-  default.
-- Memory: reset terminal Stage 1 error jobs to claimable pending state and
-  enqueue the native global consolidation job.
-- `.DS_Store`: remove tracked Finder metadata from the memory git index while
-  keeping local ignored files.
-- Sessions/history: compare indexes and report drift only.
-- Logs: report integrity and freelist stats only.
+- Automations/badge: report unread run-instance count. The `workstation`
+  profile preserves valid `PENDING_REVIEW`/`ACCEPTED` runs and marks read only
+  broken/non-navigable rows. The explicit `clear-current-badge` profile also
+  marks current valid, navigable review rows read.
+- Memory: reset retryable terminal Stage 1 error jobs to claimable pending
+  state and enqueue the native global consolidation job. Auth/401 failures are
+  reported as credential/config blockers and are not blindly retried.
+- `.DS_Store`: remove tracked Finder metadata from the memory git index and
+  commit that exact untracking while keeping local ignored files.
+- Sessions/history: rebuild `session_index.jsonl` after rollout-file alignment
+  proof by merging distinct current thread titles from `state_5.sqlite` with
+  latest valid legacy fallback names for threads that still have blank/default
+  SQLite titles. Do not rewrite `history.jsonl`; it is reported as
+  message-history drift only.
+- Logs: compact `logs_2.sqlite` freelist pages with `VACUUM` when reclaimable
+  space is above the threshold. The lane backs up DB/WAL/SHM first and records
+  before/after page, count, and byte stats without log bodies.
 
 ## Development
 

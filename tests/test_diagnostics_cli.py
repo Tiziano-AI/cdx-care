@@ -65,8 +65,9 @@ class CdxCareDiagnosticsCliTest(unittest.TestCase):
             global_job = require_json_object(jobs["global_consolidation"], "global_consolidation")
             self.assertEqual("ok", codex_dev_db["quick_check"])
             self.assertIn("schema_fingerprint", require_json_object(report["codex_dev"], "codex_dev"))
-            self.assertFalse(sessions["reindex_apply_supported"])
-            self.assertFalse(logs["compaction_apply_supported"])
+            self.assertTrue(sessions["session_index_rebuild_apply_supported"])
+            self.assertFalse(sessions["history_apply_supported"])
+            self.assertTrue(logs["compaction_apply_supported"])
             self.assertIn("last_error_present", global_job)
             self.assertEqual(0o700, diagnosis_path.parent.stat().st_mode & 0o777)
             self.assertEqual(0o600, diagnosis_path.stat().st_mode & 0o777)
@@ -121,9 +122,10 @@ class CdxCareDiagnosticsCliTest(unittest.TestCase):
             real_dir.mkdir()
             link_dir = Path(tmp) / "link-dir"
             os.symlink(real_dir, link_dir, target_is_directory=True)
-            with self.assertRaises(CdxCareError) as caught_link_plan:
-                write_plan(plan, link_dir / "plan.json")
-            self.assertEqual("unsafe_output_path", caught_link_plan.exception.code)
+            symlink_parent_plan = link_dir / "plan.json"
+            write_plan(plan, symlink_parent_plan)
+            self.assertTrue(symlink_parent_plan.exists())
+            self.assertEqual(0o600, symlink_parent_plan.stat().st_mode & 0o777)
             with self.assertRaises(CdxCareError) as caught_link_pack:
                 blank_page_pack(stores, link_dir)
             self.assertEqual("unsafe_output_path", caught_link_pack.exception.code)

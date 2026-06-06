@@ -154,6 +154,36 @@ class CdxCareMemoryAuthPolicyTest(unittest.TestCase):
             self.assertNotIn("memory.stage1_retry.auth_blocked", {str(row.get("code")) for row in denials})
             self.assertNotIn("Missing bearer", str(plan))
 
+    def test_apply_allows_recovered_auth_plan_with_non_auth_memory_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            set_stage1_error(
+                stores.db_path("memories"),
+                job_key="thread-memory-error",
+                last_error="401 Unauthorized: Missing bearer or basic authentication in header",
+                retry_remaining=0,
+                finished_at=200,
+            )
+            set_stage1_error(
+                stores.db_path("memories"),
+                job_key="thread-memory-retryable",
+                last_error="context window exceeded",
+                retry_remaining=0,
+                finished_at=250,
+            )
+            insert_stage1_done(stores.db_path("memories"), job_key="thread-memory-after-auth", finished_at=300)
+            plan = generate_plan(stores, "workstation")
+            plan["planned_actions"] = [
+                first_action(plan, "memory-stage1-retry:thread-memory-error"),
+                first_action(plan, "memory-stage1-retry:thread-memory-retryable"),
+            ]
+
+            receipt = apply_plan(stores, plan)
+            applied_actions = require_json_object_list(receipt["applied_actions"], "applied_actions")
+
+            self.assertTrue(receipt["ok"])
+            self.assertEqual(2, len(applied_actions))
+
     def test_apply_denies_tampered_auth_memory_retry_before_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stores = make_fixture(Path(tmp))

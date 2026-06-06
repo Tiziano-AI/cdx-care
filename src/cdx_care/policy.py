@@ -330,7 +330,12 @@ def verify_memory_auth_blockers(conn: sqlite3.Connection, action: JsonObject) ->
     if action.get("lane") not in {"memory.stage1_retry_terminal_errors", "memory.force_global_consolidation"}:
         return
     live_recovery = memory_auth_recovery_report(conn)
-    if bool(live_recovery.get("recovered")) and action_recovery_matches(action, live_recovery):
+    if bool(live_recovery.get("recovered")):
+        if action_has_auth_recovery_marker(action) and not action_recovery_matches(action, live_recovery):
+            raise CdxCareError(
+                "memory auth recovery marker does not match current DB recovery proof",
+                code="row_not_eligible",
+            )
         return
     rows = conn.execute(
         """
@@ -363,6 +368,12 @@ def action_recovery_matches(action: JsonObject, live_recovery: JsonObject) -> bo
         == live_recovery.get("latest_successful_stage1_finished_at")
         and recovery.get("recovery_evidence") == live_recovery.get("recovery_evidence")
     )
+
+
+def action_has_auth_recovery_marker(action: JsonObject) -> bool:
+    """Return whether a memory action carries auth-recovery metadata."""
+    extra = action.get("extra")
+    return isinstance(extra, dict) and isinstance(extra.get("auth_recovery"), dict)
 
 
 def action_declares_current_auth_recovery(action: JsonObject, row: sqlite3.Row) -> bool:

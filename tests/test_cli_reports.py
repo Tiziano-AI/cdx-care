@@ -133,7 +133,7 @@ class CdxCareCliReportTest(unittest.TestCase):
             next_commands = payload["next_commands"]
             if not isinstance(next_commands, list):
                 raise AssertionError("next_commands must be a list")
-            self.assertIn("plan --profile clear-current-badge", " ".join(str(row) for row in next_commands))
+            self.assertIn("prep --profile clear-current-badge", " ".join(str(row) for row in next_commands))
             lsof = require_json_object(payload["lsof"], "lsof")
             self.assertIn("handle_count", lsof)
             codex_dev = require_json_object(payload["codex_dev"], "codex_dev")
@@ -233,8 +233,8 @@ class CdxCareCliReportTest(unittest.TestCase):
                 require_json_object(payload["error"], "error")["code"],
             )
             next_step = str(require_json_object(payload["error"], "error")["next_step"])
-            self.assertIn("plan --profile clear-current-badge", next_step)
-            self.assertIn("apply --plan", next_step)
+            self.assertIn("prep --profile clear-current-badge", next_step)
+            self.assertIn("apply_command", next_step)
             self.assertNotIn("rerun the same command", next_step.lower())
             self.assertFalse((stores.care_root / "plans").exists())
             self.assertFalse((stores.care_root / "receipts").exists())
@@ -266,8 +266,8 @@ class CdxCareCliReportTest(unittest.TestCase):
             error = require_json_object(payload["error"], "error")
             self.assertEqual("manual_profile_requires_plan_review", error["code"])
             next_step = str(error["next_step"])
-            self.assertIn("plan --profile clear-current-badge", next_step)
-            self.assertIn("apply --plan", next_step)
+            self.assertIn("prep --profile clear-current-badge", next_step)
+            self.assertIn("apply_command", next_step)
             self.assertNotIn("--apply-approved", next_step)
             self.assertFalse((stores.care_root / "plans").exists())
             self.assertFalse((stores.care_root / "receipts").exists())

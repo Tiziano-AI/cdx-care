@@ -20,35 +20,43 @@ Start from any repo with:
 ```bash
 command -v cdx-care
 cdx-care --help
-cdx-care --json doctor
+cdx-care --json prep --profile workstation
 ```
 
-`doctor` is read-only and safe while Codex is open. Treat source files,
-installed CLI proof, live app UI, DB receipts, and rendered app behavior as
-separate evidence layers. Bare `doctor` is summary-first; use
+`prep` is the normal operator pre-scan. It is read-only for Codex DBs, writes a
+private plan under `~/.codex/cdx-care/plans/`, summarizes actions and denials,
+and returns the exact `apply_command` to run after review. `doctor` is also
+read-only and safe while Codex is open. Treat source files, installed CLI
+proof, live app UI, DB receipts, and rendered app behavior as separate
+evidence layers. Bare `doctor` is summary-first; use
 `cdx-care --json doctor --details --limit N` only when you need bounded row
 details or raw `lsof` handle rows.
 
 ## Safe operating order
 
-1. Run `cdx-care --json doctor`.
-2. For repeatable repairs, generate a plan:
+1. Run the pre-scan:
 
    ```bash
-   cdx-care --json plan --profile workstation --out /tmp/cdx-care-plan.json
+   cdx-care --json prep --profile workstation
    ```
 
-3. Review `planned_actions[]` and `denials[]`. Default policy is
+2. Review `action_summary`, `denial_summary`, `plan_path`, and
+   `operator_message`. Default policy is
    `hide broken only`: valid `PENDING_REVIEW`/`ACCEPTED` automation runs remain
    unread.
-4. Quit Codex before any apply.
-5. Apply only an approved plan:
+3. Quit Codex before any apply.
+4. Apply only the exact generated plan by copying the returned
+   `apply_command`, for example:
 
    ```bash
-   cdx-care --json apply --plan /tmp/cdx-care-plan.json
+   cdx-care --json apply --plan /Users/tiziano/.codex/cdx-care/plans/<run_id>.json
    ```
 
-   or, only when the already approved workstation policy is acceptable without
+   `plan --out` remains available for custom artifact paths, but future agents
+   should not require operators to compose shell/Python review pipelines.
+
+   `run --apply-approved` remains available only when the already approved
+   workstation policy is acceptable without
    another interactive review, run it in one shot after Codex is closed:
 
    ```bash
@@ -66,14 +74,14 @@ details or raw `lsof` handle rows.
    `PENDING_REVIEW`/`ACCEPTED` run instances read, not only broken rows:
 
    ```bash
-   cdx-care --json plan --profile clear-current-badge --out /tmp/cdx-care-clear-badge-plan.json
-   cdx-care --json apply --plan /tmp/cdx-care-clear-badge-plan.json
+   cdx-care --json prep --profile clear-current-badge
+   cdx-care --json apply --plan /Users/tiziano/.codex/cdx-care/plans/<run_id>.json
    ```
 
    Do not use `run --profile clear-current-badge --apply-approved`; the CLI
    intentionally denies that shortcut so the valid badge rows are reviewed first.
 
-6. Reopen Codex and rerun `cdx-care --json doctor` plus the user-visible app
+5. Reopen Codex and rerun `cdx-care --json doctor` plus the user-visible app
    check. A DB receipt is not rendered UI proof.
 
 ## Diagnostics and raw reads

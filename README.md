@@ -39,20 +39,26 @@ guarded reconciliation of DB/state drift without editing vendor Codex source.
 
 ```bash
 cdx-care --json doctor
+cdx-care --json prep --profile workstation
+cdx-care --json apply --plan ~/.codex/cdx-care/plans/<run_id>.json
 cdx-care --json plan --profile workstation --out /tmp/cdx-care-plan.json
 cdx-care --json apply --plan /tmp/cdx-care-plan.json
 cdx-care --json run --profile workstation --apply-approved
-cdx-care --json plan --profile clear-current-badge --out /tmp/cdx-care-clear-badge-plan.json
+cdx-care --json prep --profile clear-current-badge
 cdx-care --json diagnose blank-page --out-dir /tmp/cdx-care-blank-page-new
 cdx-care --json raw sql --db codex-dev --query-file query.sql --readonly
 ```
 
-Use `apply` only after quitting Codex. `doctor` is safe with Codex open. The
-canonical write path is `doctor → plan → review → apply`. Default `doctor`
-output is summary-first; use `cdx-care --json doctor --details --limit N` when
-you need bounded row lists or raw `lsof` handle rows. `run --apply-approved` is
-only the no-interactive-review shortcut for the already approved workstation
-policy; it still writes the generated plan and runs the same apply gates.
+Use `apply` only after quitting Codex. `doctor` and `prep` are safe while Codex
+is open because they do not mutate Codex DBs. The canonical operator path is
+now `prep → apply`: `prep` performs the pre-scan, writes a private plan under
+`~/.codex/cdx-care/plans/`, summarizes actions/denials, and returns the exact
+`apply_command` to run if approved. Default `doctor` output is summary-first;
+use `cdx-care --json doctor --details --limit N` only when you need bounded row
+lists or raw `lsof` handle rows. `plan --out` remains the low-level explicit
+artifact form. `run --apply-approved` is only a no-interactive-review shortcut
+for the already approved workstation policy; it still writes the generated
+plan and runs the same apply gates.
 
 `workstation` is conservative: it hides broken/non-navigable unread rows but
 keeps valid automation review rows unread. If the desired user-visible outcome

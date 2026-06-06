@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import sqlite3
 import sys
@@ -29,7 +30,7 @@ from cdx_care.paths import DB_RELATIVE_PATHS, StorePaths, store_paths
 from cdx_care.plan import generate_plan, write_plan
 from cdx_care.raw_sql import raw_sql_readonly
 from cdx_care.support_paths import preflight_managed_artifact_path
-from cdx_care.types import JsonObject
+from cdx_care.types import JsonObject, require_json_object_list
 
 PLAN_PROFILES = ("workstation", "clear-current-badge")
 
@@ -47,6 +48,22 @@ def build_parser() -> ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor", help="Read-only state and DB health report.")
     doctor_parser.add_argument("--details", action="store_true", help="Include bounded row arrays and lsof handles.")
     doctor_parser.add_argument("--limit", type=int, default=50, help="Maximum rows per detailed doctor list.")
+
+    prep_parser = subparsers.add_parser(
+        "prep",
+        help="Pre-scan, write a private managed plan, and print the exact apply command.",
+    )
+    prep_parser.add_argument(
+        "--profile",
+        default="workstation",
+        choices=PLAN_PROFILES,
+        help="Policy profile: workstation hides broken rows; clear-current-badge also marks valid review runs read.",
+    )
+    prep_parser.add_argument(
+        "--out",
+        type=Path,
+        help="Optional plan output JSON path. Defaults to ~/.codex/cdx-care/plans/<run_id>.json.",
+    )
 
     plan_parser = subparsers.add_parser("plan", help="Create a reviewable reconciliation plan.")
     plan_parser.add_argument(
@@ -121,6 +138,8 @@ def dispatch(args: Namespace, stores: StorePaths) -> JsonObject:
     command = str(args.command)
     if command == "doctor":
         return command_doctor(args, stores)
+    if command == "prep":
+        return command_prep(args, stores)
     if command == "plan":
         return command_plan(args, stores)
     if command == "apply":
@@ -160,25 +179,21 @@ def doctor_next_commands(report: JsonObject) -> list[str]:
         commands = ["Fix error findings, then rerun: cdx-care --json doctor"]
         if badge_count > 0:
             commands.append(
-                "Explicit badge clear after Codex is closed: cdx-care --json plan "
-                "--profile clear-current-badge --out /tmp/cdx-care-clear-badge-plan.json"
+                "Explicit badge clear pre-scan: cdx-care --json prep --profile clear-current-badge"
             )
         return commands
     if not bool(report.get("codex_closed")):
         commands = [
-            "For review only: cdx-care --json plan --profile workstation --out /tmp/cdx-care-plan.json",
-            "Quit Codex before any: cdx-care --json apply --plan /tmp/cdx-care-plan.json",
+            "Pre-scan: cdx-care --json prep --profile workstation",
+            "Quit Codex before running the apply_command returned by prep.",
         ]
     else:
         commands = [
-            "Review a fresh plan: cdx-care --json plan --profile workstation --out /tmp/cdx-care-plan.json",
-            "Apply only after review: cdx-care --json apply --plan /tmp/cdx-care-plan.json",
+            "Pre-scan: cdx-care --json prep --profile workstation",
+            "Apply only after review: run the apply_command returned by prep.",
         ]
     if badge_count > 0:
-        commands.append(
-            "Explicit badge clear: cdx-care --json plan --profile clear-current-badge "
-            "--out /tmp/cdx-care-clear-badge-plan.json"
-        )
+        commands.append("Explicit badge clear pre-scan: cdx-care --json prep --profile clear-current-badge")
     return commands
 
 
@@ -203,6 +218,47 @@ def command_plan(args: Namespace, stores: StorePaths) -> JsonObject:
     return plan
 
 
+def command_prep(args: Namespace, stores: StorePaths) -> JsonObject:
+    """Generate a private plan and return a compact operator handoff."""
+    plan = generate_plan(stores, str(args.profile))
+    out_path = optional_path(args, "out")
+    plan_path = out_path if out_path else managed_plan_path(stores, plan)
+    if not out_path:
+        preflight_managed_artifact_path(stores, plan_path, "plan file")
+        ensure_private_dir(plan_path.parent)
+    write_plan(plan, plan_path)
+    actions = require_json_object_list(plan["planned_actions"], "planned_actions")
+    denials = require_json_object_list(plan["denials"], "denials")
+    action_count_value = plan.get("action_count")
+    action_count = action_count_value if isinstance(action_count_value, int) else len(actions)
+    codex_closed = bool(plan.get("codex_closed"))
+    apply_command = f"cdx-care --json apply --plan {shlex.quote(str(plan_path))}"
+    operator_status = prep_operator_status(action_count=action_count, codex_closed=codex_closed)
+    return {
+        "schema_version": 1,
+        "tool": "cdx-care",
+        "version": VERSION,
+        "command": "prep",
+        "ok": True,
+        "run_id": str(plan["run_id"]),
+        "support_root": str(stores.codex_home),
+        "profile": str(plan["profile"]),
+        "approved_policy": str(plan["approved_policy"]),
+        "codex_closed": codex_closed,
+        "plan_path": str(plan_path),
+        "action_count": action_count,
+        "action_summary": summarize_actions(actions),
+        "denial_count": len(denials),
+        "denial_summary": summarize_denials(denials),
+        "safe_to_apply_now": operator_status == "ready_to_apply",
+        "operator_status": operator_status,
+        "operator_message": prep_operator_message(operator_status),
+        "apply_command": apply_command,
+        "next_commands": prep_next_commands(operator_status, apply_command, str(plan["profile"])),
+        "receipt_path": None,
+    }
+
+
 def command_apply(args: Namespace, stores: StorePaths) -> JsonObject:
     """Apply a plan file."""
     plan_path = require_path(args, "plan")
@@ -222,16 +278,18 @@ def command_run(args: Namespace, stores: StorePaths) -> JsonObject:
     """Generate and apply the default approved policy."""
     if str(args.profile) == "clear-current-badge":
         raise CdxCareError(
-            "clear-current-badge is review-first; run plan --profile clear-current-badge, inspect it, then apply",
+            "clear-current-badge is review-first; run prep --profile clear-current-badge, inspect it, then apply",
             code="manual_profile_requires_plan_review",
         )
     if not bool(args.apply_approved):
-        raise CdxCareError("run requires --apply-approved; use plan for read-only preview", code="apply_not_approved")
+        raise CdxCareError(
+            "run requires --apply-approved; use prep for the review-first workflow",
+            code="apply_not_approved",
+        )
     plan = generate_plan(stores, str(args.profile))
-    plan_root = stores.care_root / "plans"
-    plan_path = plan_root / f"{plan['run_id']}.json"
+    plan_path = managed_plan_path(stores, plan)
     preflight_managed_artifact_path(stores, plan_path, "plan file")
-    ensure_private_dir(plan_root)
+    ensure_private_dir(plan_path.parent)
     write_plan(plan, plan_path)
     try:
         receipt = apply_plan(stores, plan)
@@ -281,6 +339,78 @@ def require_path(args: Namespace, name: str) -> Path:
     if not isinstance(value, Path):
         raise CdxCareError(f"missing path argument: --{name.replace('_', '-')}", code="missing_path")
     return value
+
+
+def optional_path(args: Namespace, name: str) -> Path | None:
+    """Read an optional Path attribute from argparse."""
+    value = getattr(args, name, None)
+    if value is None:
+        return None
+    if not isinstance(value, Path):
+        raise CdxCareError(f"invalid path argument: --{name.replace('_', '-')}", code="missing_path")
+    return value
+
+
+def managed_plan_path(stores: StorePaths, plan: JsonObject) -> Path:
+    """Return the private managed plan path for a generated plan."""
+    return stores.care_root / "plans" / f"{plan['run_id']}.json"
+
+
+def summarize_actions(actions: list[JsonObject]) -> list[JsonObject]:
+    """Summarize planned actions by lane/type/db for operator review."""
+    counts: dict[tuple[str, str, str], int] = {}
+    for action in actions:
+        key = (stringish(action.get("lane")), stringish(action.get("type")), stringish(action.get("db")))
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"lane": lane, "type": action_type, "db": db_name or None, "count": count}
+        for (lane, action_type, db_name), count in sorted(counts.items())
+    ]
+
+
+def summarize_denials(denials: list[JsonObject]) -> list[JsonObject]:
+    """Summarize denials by stable code for compact pre-scan output."""
+    counts: dict[tuple[str, str], int] = {}
+    for denial in denials:
+        code = stringish(denial.get("code"))
+        reason = stringish(denial.get("message")) or stringish(denial.get("reason"))
+        key = (code, reason)
+        counts[key] = counts.get(key, 0) + 1
+    return [{"code": code, "reason": reason, "count": count} for (code, reason), count in sorted(counts.items())]
+
+
+def prep_operator_status(*, action_count: int, codex_closed: bool) -> str:
+    """Classify the pre-scan outcome for humans and scripts."""
+    if action_count == 0:
+        return "nothing_to_apply"
+    if not codex_closed:
+        return "quit_codex_then_apply"
+    return "ready_to_apply"
+
+
+def prep_operator_message(operator_status: str) -> str:
+    """Return one compact human message for a pre-scan status."""
+    if operator_status == "nothing_to_apply":
+        return "No planned write actions. Keep the plan for evidence or rerun prep after Codex state changes."
+    if operator_status == "quit_codex_then_apply":
+        return "Pre-scan complete, but Codex still has DB handles. Quit Codex completely before apply."
+    return "Pre-scan complete. Review action_summary/denial_summary, then run apply_command if approved."
+
+
+def prep_next_commands(operator_status: str, apply_command: str, profile: str) -> list[str]:
+    """Return a tiny copy-paste path after prep."""
+    if operator_status == "nothing_to_apply":
+        return ["cdx-care --json prep --profile workstation"]
+    if operator_status == "quit_codex_then_apply":
+        return ["Quit Codex completely.", apply_command]
+    if profile == "clear-current-badge":
+        return ["Review this manual badge-clear plan.", apply_command]
+    return [apply_command]
+
+
+def stringish(value: object) -> str:
+    """Return a string value or an empty string."""
+    return value if isinstance(value, str) else ""
 
 
 if __name__ == "__main__":

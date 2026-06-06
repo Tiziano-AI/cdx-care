@@ -71,6 +71,34 @@ class CdxCareCliEnvelopeTest(unittest.TestCase):
             self.assertTrue(require_json_object_list(payload["applied_actions"], "applied_actions"))
             self.assertTrue(Path(str(payload["receipt_path"])).exists())
 
+    def test_cli_prep_writes_private_managed_plan_and_apply_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+
+            exit_code, payload, stderr = run_cli_json(["--json", "--codex-home", str(stores.codex_home), "prep"])
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual("", stderr)
+            self.assertTrue(payload["ok"])
+            self.assertEqual("prep", payload["command"])
+            plan_path = Path(str(payload["plan_path"]))
+            self.assertEqual(stores.care_root / "plans", plan_path.parent)
+            self.assertTrue(plan_path.exists())
+            self.assertEqual(0o700, plan_path.parent.stat().st_mode & 0o777)
+            self.assertEqual(0o600, plan_path.stat().st_mode & 0o777)
+            self.assertEqual(f"cdx-care --json apply --plan {plan_path}", payload["apply_command"])
+            action_count = payload["action_count"]
+            if not isinstance(action_count, int):
+                raise AssertionError("action_count must be an integer")
+            self.assertGreater(action_count, 0)
+            self.assertIn(str(payload["operator_status"]), {"ready_to_apply", "quit_codex_then_apply"})
+            self.assertIsInstance(payload["action_summary"], list)
+            self.assertIsInstance(payload["denial_summary"], list)
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["run_id"], plan["run_id"])
+            self.assertEqual(payload["support_root"], plan["support_root"])
+            self.assertEqual(payload["action_count"], plan["action_count"])
+
     def test_cli_plan_allows_existing_symlink_parent_like_macos_tmp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stores = make_fixture(Path(tmp))

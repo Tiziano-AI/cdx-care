@@ -190,12 +190,14 @@ def next_step_for_error(code: str) -> str:
     if code == "lsof_unavailable":
         return "Install or restore lsof visibility; cdx-care refuses DB writes without the handle check."
     if code == "apply_not_approved":
-        return "Use plan for read-only preview, or pass --apply-approved only after review and after quitting Codex."
+        return (
+            "Use cdx-care --json prep first; run the returned apply_command only after review "
+            "and after quitting Codex."
+        )
     if code == "manual_profile_requires_plan_review":
         return (
-            "Run cdx-care --json plan --profile clear-current-badge --out /tmp/cdx-care-clear-badge-plan.json, "
-            "inspect planned_actions and denials, quit Codex until doctor reports codex_closed true, "
-            "then apply that exact reviewed plan with cdx-care --json apply --plan /tmp/cdx-care-clear-badge-plan.json."
+            "Run cdx-care --json prep --profile clear-current-badge, inspect action_summary and denial_summary, "
+            "quit Codex until prep reports codex_closed true, then run the returned apply_command."
         )
     if code in {"output_exists", "receipt_exists"}:
         return "Choose a new output path or inspect the existing file before retrying."

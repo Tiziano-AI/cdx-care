@@ -55,9 +55,9 @@ details or raw `lsof` handle rows.
    `plan --out` remains available for custom artifact paths, but future agents
    should not require operators to compose shell/Python review pipelines.
 
-   `run --apply-approved` remains available only when the already approved
-   workstation policy is acceptable without
-   another interactive review, run it in one shot after Codex is closed:
+   `run --apply-approved` remains available when the already approved
+   workstation policy is acceptable without another interactive review. Run it
+   in one shot after Codex is closed:
 
    ```bash
    cdx-care --json run --profile workstation --apply-approved
@@ -70,7 +70,7 @@ details or raw `lsof` handle rows.
    proof works again.
 
    If the operator explicitly wants the current automation badge cleared, use
-   the review-first opt-in profile instead. It marks valid, navigable unread
+   the review-first opt-in profile. It marks valid, navigable unread
    `PENDING_REVIEW`/`ACCEPTED` run instances read, not only broken rows:
 
    ```bash
@@ -78,11 +78,23 @@ details or raw `lsof` handle rows.
    cdx-care --json apply --plan /Users/tiziano/.codex/cdx-care/plans/<run_id>.json
    ```
 
-   Do not use `run --profile clear-current-badge --apply-approved`; the CLI
-   intentionally denies that shortcut so the valid badge rows are reviewed first.
+   If the operator already approves that specific badge-clearing effect and
+   wants the no-interactive-review path, the one-shot form requires both
+   acknowledgement flags:
+
+   ```bash
+   cdx-care --json run --profile clear-current-badge --apply-approved --manual-clear-current-badge
+   ```
+
+   Without both flags, the manual profile denies before writing a plan, backup,
+   receipt, or DB row.
 
 5. Reopen Codex and rerun `cdx-care --json doctor` plus the user-visible app
-   check. A DB receipt is not rendered UI proof.
+   check. A DB receipt is not rendered UI proof. A receipt that lacks the
+   `automations.clear_current_badge` lane did not clear valid badge rows, even
+   when it successfully applied workstation, sessions, logs, memory, or git
+   hygiene lanes. Prefer the receipt `profile` and `approved_policy` fields for
+   quick audit, then inspect lanes for exact mutation scope.
 
 ## Diagnostics and raw reads
 

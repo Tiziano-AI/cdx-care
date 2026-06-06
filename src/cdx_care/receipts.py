@@ -19,6 +19,8 @@ from cdx_care.types import JsonObject, JsonValue
 def failure_receipt(
     stores: StorePaths,
     run_id: str,
+    profile: str,
+    approved_policy: str,
     actions: list[JsonObject],
     backups: list[JsonObject],
     applied: list[JsonValue],
@@ -34,6 +36,8 @@ def failure_receipt(
         "tool": "cdx-care",
         "version": VERSION,
         "run_id": run_id,
+        "profile": profile,
+        "approved_policy": approved_policy,
         "applied_at": iso_now(),
         "support_root": str(stores.codex_home),
         "codex_closed": True,
@@ -45,7 +49,7 @@ def failure_receipt(
         "git_preflights": git_preflights,
         "applied_actions": applied,
         "partial": partial,
-        "next_commands": post_apply_next_commands(stores),
+        "next_commands": post_apply_next_commands(stores, actions, applied),
         "ok": False,
         "error": {"code": code, "message": str(error)},
     }
@@ -61,13 +65,41 @@ def write_receipt_file(receipt_path: Path, receipt: JsonObject) -> None:
         handle.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
 
 
-def post_apply_next_commands(stores: StorePaths) -> list[str]:
+def post_apply_next_commands(
+    stores: StorePaths, planned_actions: list[JsonObject], applied_actions: list[JsonValue]
+) -> list[str]:
     """Return machine-readable post-write proof steps."""
     root = shlex.quote(str(stores.codex_home))
-    return [
-        f"cdx-care --json --codex-home {root} doctor",
-        "Restart Codex and verify the app badge, automations review list, blank-page case, and memory jobs in the UI.",
-    ]
+    commands = [f"cdx-care --json --codex-home {root} doctor"]
+    planned_lanes = action_lanes(planned_actions)
+    applied_lanes = action_lanes(applied_actions)
+    if "automations.clear_current_badge" in applied_lanes:
+        commands.append("Restart Codex and verify the app badge and automations review list in the UI.")
+    elif "automations.clear_current_badge" in planned_lanes:
+        commands.append(
+            "Badge-clear did not complete; inspect the receipt, rerun doctor, then generate a fresh "
+            "clear-current-badge plan."
+        )
+    else:
+        commands.append(
+            "This run did not clear valid automation badge rows; if the badge is still the target, run "
+            "cdx-care --json prep --profile clear-current-badge."
+        )
+        commands.append(
+            "Verify only the lanes applied by this receipt, such as sessions, logs, memory, or git hygiene."
+        )
+    return commands
+
+
+def action_lanes(actions: list[JsonObject] | list[JsonValue]) -> set[str]:
+    """Return stable lane names from planned or applied action objects."""
+    lanes: set[str] = set()
+    for action in actions:
+        if isinstance(action, dict):
+            lane = action.get("lane")
+            if isinstance(lane, str):
+                lanes.add(lane)
+    return lanes
 
 
 def path_present(path: Path) -> bool:

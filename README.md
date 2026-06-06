@@ -45,6 +45,7 @@ cdx-care --json plan --profile workstation --out /tmp/cdx-care-plan.json
 cdx-care --json apply --plan /tmp/cdx-care-plan.json
 cdx-care --json run --profile workstation --apply-approved
 cdx-care --json prep --profile clear-current-badge
+cdx-care --json run --profile clear-current-badge --apply-approved --manual-clear-current-badge
 cdx-care --json diagnose blank-page --out-dir /tmp/cdx-care-blank-page-new
 cdx-care --json raw sql --db codex-dev --query-file query.sql --readonly
 ```
@@ -64,13 +65,26 @@ plan and runs the same apply gates.
 keeps valid automation review rows unread. If the desired user-visible outcome
 is “clear the current automation badge”, use the explicit
 `clear-current-badge` profile after reviewing that it will mark valid
-`PENDING_REVIEW`/`ACCEPTED` run instances as read. `run --profile
-clear-current-badge --apply-approved` is denied on purpose; generate the plan,
-inspect it, then apply that exact plan.
+`PENDING_REVIEW`/`ACCEPTED` run instances as read. The review-first path is
+`prep --profile clear-current-badge`, inspect `action_summary`, then apply that
+exact plan. If the operator already approves this specific badge-clearing
+effect and Codex is closed, the one-shot form is intentionally verbose:
+
+```bash
+cdx-care --json run --profile clear-current-badge --apply-approved --manual-clear-current-badge
+```
+
+Without both acknowledgement flags the manual profile denies before writing a
+plan, backup, receipt, or DB row.
 
 All JSON success/error responses include at least `schema_version`, `tool`,
 `version`, and `ok`. State-aware commands also include `support_root`, and
-write commands include the generated/applied action lists plus the receipt path.
+write commands include `profile`, `approved_policy`, the generated/applied
+action lists, and the receipt path.
+Post-apply `next_commands` are lane-aware: a `workstation` receipt explicitly
+says it did not clear valid automation badge rows, while a
+`clear-current-badge` receipt is the only receipt that asks you to verify the
+app badge.
 
 ## Current v1 lanes
 

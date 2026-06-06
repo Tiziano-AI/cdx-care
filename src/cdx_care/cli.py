@@ -83,12 +83,20 @@ def build_parser() -> ArgumentParser:
         default="workstation",
         choices=PLAN_PROFILES,
         help=(
-            "Policy profile. workstation is the only one-shot profile; "
-            "clear-current-badge is review-first and denied."
+            "Policy profile. workstation is the default one-shot profile; "
+            "clear-current-badge also requires --manual-clear-current-badge."
         ),
     )
     run_parser.add_argument(
         "--apply-approved", action="store_true", help="Acknowledge Codex is closed and apply gates may run."
+    )
+    run_parser.add_argument(
+        "--manual-clear-current-badge",
+        action="store_true",
+        help=(
+            "Second explicit acknowledgement for one-shot clear-current-badge. "
+            "Marks current valid automation review rows read after the same closed-Codex apply gates."
+        ),
     )
 
     diagnose_parser = subparsers.add_parser("diagnose", help="Write read-only evidence packs.")
@@ -178,22 +186,20 @@ def doctor_next_commands(report: JsonObject) -> list[str]:
     if not bool(report.get("ok")):
         commands = ["Fix error findings, then rerun: cdx-care --json doctor"]
         if badge_count > 0:
-            commands.append(
-                "Explicit badge clear pre-scan: cdx-care --json prep --profile clear-current-badge"
-            )
+            commands.append("Badge clear pre-scan: cdx-care --json prep --profile clear-current-badge")
         return commands
     if not bool(report.get("codex_closed")):
         commands = [
-            "Pre-scan: cdx-care --json prep --profile workstation",
+            "Conservative pre-scan (does not clear valid badge rows): cdx-care --json prep --profile workstation",
             "Quit Codex before running the apply_command returned by prep.",
         ]
     else:
         commands = [
-            "Pre-scan: cdx-care --json prep --profile workstation",
+            "Conservative pre-scan (does not clear valid badge rows): cdx-care --json prep --profile workstation",
             "Apply only after review: run the apply_command returned by prep.",
         ]
     if badge_count > 0:
-        commands.append("Explicit badge clear pre-scan: cdx-care --json prep --profile clear-current-badge")
+        commands.insert(0, "Badge clear pre-scan: cdx-care --json prep --profile clear-current-badge")
     return commands
 
 
@@ -277,10 +283,16 @@ def command_apply(args: Namespace, stores: StorePaths) -> JsonObject:
 def command_run(args: Namespace, stores: StorePaths) -> JsonObject:
     """Generate and apply the default approved policy."""
     if str(args.profile) == "clear-current-badge":
-        raise CdxCareError(
-            "clear-current-badge is review-first; run prep --profile clear-current-badge, inspect it, then apply",
-            code="manual_profile_requires_plan_review",
-        )
+        if not bool(args.apply_approved):
+            raise CdxCareError(
+                "clear-current-badge one-shot requires --apply-approved and --manual-clear-current-badge",
+                code="manual_profile_requires_approval",
+            )
+        if not bool(args.manual_clear_current_badge):
+            raise CdxCareError(
+                "clear-current-badge one-shot requires --manual-clear-current-badge",
+                code="manual_profile_requires_acknowledgement",
+            )
     if not bool(args.apply_approved):
         raise CdxCareError(
             "run requires --apply-approved; use prep for the review-first workflow",
@@ -302,6 +314,8 @@ def command_run(args: Namespace, stores: StorePaths) -> JsonObject:
         "ok": True,
         "run_id": str(plan["run_id"]),
         "support_root": str(stores.codex_home),
+        "profile": str(plan["profile"]),
+        "approved_policy": str(plan["approved_policy"]),
         "codex_closed": receipt.get("codex_closed", False),
         "plan_path": str(plan_path),
         "planned_actions": plan["planned_actions"],

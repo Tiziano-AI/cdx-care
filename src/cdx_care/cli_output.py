@@ -199,6 +199,16 @@ def next_step_for_error(code: str) -> str:
             "Run cdx-care --json prep --profile clear-current-badge, inspect action_summary and denial_summary, "
             "quit Codex until prep reports codex_closed true, then run the returned apply_command."
         )
+    if code == "manual_profile_requires_approval":
+        return (
+            "Quit Codex, then rerun with both acknowledgements: "
+            "cdx-care --json run --profile clear-current-badge --apply-approved --manual-clear-current-badge."
+        )
+    if code == "manual_profile_requires_acknowledgement":
+        return (
+            "If you intend to mark current valid automation review rows read, rerun with "
+            "--manual-clear-current-badge after quitting Codex."
+        )
     if code in {"output_exists", "receipt_exists"}:
         return "Choose a new output path or inspect the existing file before retrying."
     if code in {"support_root_missing", "support_root_invalid", "support_root_unrecognized", "unsafe_support_path"}:

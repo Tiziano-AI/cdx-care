@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cdx-care"
-version = "0.1.2"
+version = "0.1.4"
 description = "Local Codex DB/state doctor, planner, and guarded reconciliation CLI."
 readme = "README.md"
 requires-python = ">=3.12"

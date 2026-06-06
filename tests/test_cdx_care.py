@@ -68,8 +68,11 @@ class CdxCareFixtureTest(unittest.TestCase):
             receipt = apply_plan(stores, plan)
 
             self.assertTrue(receipt["ok"])
+            self.assertEqual("workstation", receipt["profile"])
+            self.assertEqual("workstation-hide-broken-only", receipt["approved_policy"])
             self.assertTrue(Path(str(receipt["receipt_path"])).exists())
             self.assertIn("doctor", str(receipt["next_commands"]))
+            self.assertIn("did not clear valid automation badge rows", str(receipt["next_commands"]))
             backups_value = receipt["backups"]
             if not isinstance(backups_value, list):
                 raise AssertionError("receipt backups must be a list")

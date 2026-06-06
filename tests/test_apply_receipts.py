@@ -43,7 +43,10 @@ class CdxCareApplyReceiptsTest(unittest.TestCase):
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertFalse(receipt["ok"])
             self.assertTrue(receipt["partial"])
+            self.assertEqual("workstation", receipt["profile"])
+            self.assertEqual("workstation-hide-broken-only", receipt["approved_policy"])
             self.assertIn("doctor", str(receipt["next_commands"]))
+            self.assertIn("did not clear valid automation badge rows", str(receipt["next_commands"]))
             self.assertEqual("simulated_git_failure", receipt["error"]["code"])
             self.assertTrue(receipt["applied_actions"])
 

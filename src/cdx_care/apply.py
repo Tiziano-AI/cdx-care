@@ -66,6 +66,8 @@ def apply_plan(stores: StorePaths, plan: JsonObject) -> JsonObject:
     preflight_managed_artifact_path(stores, receipt_path, "receipt file")
     if backup_root.exists() or receipt_path.exists():
         raise CdxCareError("plan run_id already has backup or receipt state", code="run_id_reused")
+    profile = str(plan["profile"])
+    approved_policy = str(plan["approved_policy"])
     db_groups = group_db_actions(actions)
     for db_path, db_actions in db_groups.items():
         preflight_db_actions(db_path, db_actions, context)
@@ -103,6 +105,8 @@ def apply_plan(stores: StorePaths, plan: JsonObject) -> JsonObject:
             failed_receipt = failure_receipt(
                 stores,
                 run_id,
+                profile,
+                approved_policy,
                 actions,
                 backups,
                 applied,
@@ -118,6 +122,8 @@ def apply_plan(stores: StorePaths, plan: JsonObject) -> JsonObject:
         "tool": "cdx-care",
         "version": VERSION,
         "run_id": run_id,
+        "profile": profile,
+        "approved_policy": approved_policy,
         "applied_at": iso_now(),
         "support_root": str(stores.codex_home),
         "codex_closed": True,
@@ -128,7 +134,7 @@ def apply_plan(stores: StorePaths, plan: JsonObject) -> JsonObject:
         "file_preflights": file_preflights,
         "git_preflights": git_preflights,
         "applied_actions": applied,
-        "next_commands": post_apply_next_commands(stores),
+        "next_commands": post_apply_next_commands(stores, actions, applied),
         "ok": True,
     }
     write_receipt_file(receipt_path, success_receipt)

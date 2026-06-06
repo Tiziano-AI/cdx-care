@@ -199,6 +199,8 @@ class CdxCareCliReportTest(unittest.TestCase):
             payload = json.loads(out.getvalue())
             self.assertEqual(0, exit_code)
             self.assertTrue(payload["ok"])
+            self.assertEqual("workstation", payload["profile"])
+            self.assertEqual("workstation-hide-broken-only", payload["approved_policy"])
             plan_path = Path(str(payload["plan_path"]))
             self.assertTrue(plan_path.exists())
             self.assertEqual(0o700, plan_path.parent.stat().st_mode & 0o777)
@@ -208,9 +210,10 @@ class CdxCareCliReportTest(unittest.TestCase):
             self.assertEqual(0o700, receipt_path.parent.stat().st_mode & 0o777)
             self.assertEqual(0o600, receipt_path.stat().st_mode & 0o777)
             self.assertIn("doctor", str(payload["next_commands"]))
+            self.assertIn("did not clear valid automation badge rows", str(payload["next_commands"]))
             self.assertEqual("", err.getvalue())
 
-    def test_cli_run_denies_clear_current_badge_one_shot_without_artifacts(self) -> None:
+    def test_cli_run_denies_clear_current_badge_without_manual_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stores = make_fixture(Path(tmp))
 
@@ -229,12 +232,11 @@ class CdxCareCliReportTest(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertFalse(payload["ok"])
             self.assertEqual(
-                "manual_profile_requires_plan_review",
+                "manual_profile_requires_acknowledgement",
                 require_json_object(payload["error"], "error")["code"],
             )
             next_step = str(require_json_object(payload["error"], "error")["next_step"])
-            self.assertIn("prep --profile clear-current-badge", next_step)
-            self.assertIn("apply_command", next_step)
+            self.assertIn("--manual-clear-current-badge", next_step)
             self.assertNotIn("rerun the same command", next_step.lower())
             self.assertFalse((stores.care_root / "plans").exists())
             self.assertFalse((stores.care_root / "receipts").exists())
@@ -264,13 +266,48 @@ class CdxCareCliReportTest(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertFalse(payload["ok"])
             error = require_json_object(payload["error"], "error")
-            self.assertEqual("manual_profile_requires_plan_review", error["code"])
+            self.assertEqual("manual_profile_requires_approval", error["code"])
             next_step = str(error["next_step"])
-            self.assertIn("prep --profile clear-current-badge", next_step)
-            self.assertIn("apply_command", next_step)
-            self.assertNotIn("--apply-approved", next_step)
+            self.assertIn("--apply-approved", next_step)
+            self.assertIn("--manual-clear-current-badge", next_step)
             self.assertFalse((stores.care_root / "plans").exists())
             self.assertFalse((stores.care_root / "receipts").exists())
+            self.assertEqual("", stderr)
+
+    def test_cli_run_clear_current_badge_one_shot_requires_explicit_manual_ack_and_applies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+
+            exit_code, payload, stderr = run_cli_json(
+                [
+                    "--json",
+                    "--codex-home",
+                    str(stores.codex_home),
+                    "run",
+                    "--profile",
+                    "clear-current-badge",
+                    "--apply-approved",
+                    "--manual-clear-current-badge",
+                ]
+            )
+
+            self.assertEqual(0, exit_code)
+            self.assertTrue(payload["ok"])
+            self.assertEqual("clear-current-badge", payload["profile"])
+            self.assertEqual("manual-clear-current-badge", payload["approved_policy"])
+            self.assertTrue(Path(str(payload["plan_path"])).exists())
+            self.assertTrue(Path(str(payload["receipt_path"])).exists())
+            applied_actions = require_json_object_list(payload["applied_actions"], "applied")
+            applied_lanes = {str(action["lane"]) for action in applied_actions}
+            self.assertIn("automations.clear_current_badge", applied_lanes)
+            self.assertIn("verify the app badge", str(payload["next_commands"]))
+            self.assertNotIn("did not clear valid automation badge rows", str(payload["next_commands"]))
+            with closing(sqlite3.connect(stores.db_path("codex-dev"))) as conn:
+                read_count = conn.execute(
+                    "SELECT COUNT(*) FROM automation_runs WHERE thread_id IN ('thread-good', 'thread-accepted') "
+                    "AND read_at IS NOT NULL"
+                ).fetchone()[0]
+            self.assertEqual(2, read_count)
             self.assertEqual("", stderr)
 
     def test_cli_apply_denials_are_json_and_do_not_create_receipts_before_backup(self) -> None:

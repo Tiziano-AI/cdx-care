@@ -39,19 +39,27 @@ def memories_report(stores: StorePaths) -> JsonObject:
                 {"count": jobs["stage1_terminal_error_count"], "categories": jobs["stage1_terminal_error_categories"]},
             )
         )
+    auth_recovery = jobs.get("auth_recovery")
+    auth_recovered = isinstance(auth_recovery, dict) and bool(auth_recovery.get("recovered"))
     if jobs["stage1_auth_error_count"]:
         findings.append(
             finding(
                 "codex.memory.stage1_auth_errors",
-                "error",
+                "warn" if auth_recovered else "error",
                 (
-                    "Stage 1 memory jobs are failing on authentication; repair Codex/OpenAI credential "
-                    "loading before retry."
+                    "Stage 1 memory jobs have historical authentication errors, but later successful "
+                    "Stage 1 work suggests credentials recovered."
+                    if auth_recovered
+                    else (
+                        "Stage 1 memory jobs are failing on authentication; repair Codex/OpenAI credential "
+                        "loading before retry."
+                    )
                 ),
                 {
                     "count": jobs["stage1_auth_error_count"],
                     "terminal_count": jobs["stage1_auth_terminal_error_count"],
                     "retryable_count": jobs["stage1_auth_retryable_error_count"],
+                    "auth_recovered": auth_recovered,
                 },
             )
         )
@@ -60,12 +68,21 @@ def memories_report(stores: StorePaths) -> JsonObject:
         findings.append(
             finding(
                 "codex.memory.global_auth_error",
-                "error",
+                "warn" if auth_recovered else "error",
                 (
-                    "Global memory consolidation is failing on authentication; repair Codex/OpenAI "
-                    "credential loading before enqueueing memory workers."
+                    "Global memory consolidation has a historical authentication error, but later "
+                    "successful Stage 1 work suggests credentials recovered."
+                    if auth_recovered
+                    else (
+                        "Global memory consolidation is failing on authentication; repair Codex/OpenAI "
+                        "credential loading before enqueueing memory workers."
+                    )
                 ),
-                {"status": str(global_job.get("status")), "retry_remaining": int(global_job.get("retry_remaining", 0))},
+                {
+                    "status": str(global_job.get("status")),
+                    "retry_remaining": int(global_job.get("retry_remaining", 0)),
+                    "auth_recovered": auth_recovered,
+                },
             )
         )
     artifacts = artifact_report(stores.memories_root)
@@ -136,6 +153,7 @@ def memory_jobs_report(conn: sqlite3.Connection) -> JsonObject:
                 }
             )
     global_data = memory_global_job_report(conn)
+    auth_recovery = memory_auth_recovery_report(conn)
     returned_terminal_rows = terminal_rows[:ROW_LIMIT]
     returned_auth_rows = auth_rows[:ROW_LIMIT]
     return {
@@ -153,8 +171,76 @@ def memory_jobs_report(conn: sqlite3.Connection) -> JsonObject:
         "stage1_auth_retryable_error_count": auth_retryable_count,
         "stage1_auth_error_rows": returned_auth_rows,
         "stage1_auth_error_rows_meta": collection_metadata(len(auth_rows), len(returned_auth_rows)),
+        "auth_recovery": auth_recovery,
         "global_consolidation": global_data,
     }
+
+
+def memory_auth_recovery_report(conn: sqlite3.Connection) -> JsonObject:
+    """Report whether later successful native Stage 1 work proves auth recovered."""
+    latest_auth_row = conn.execute(
+        """
+        SELECT MAX(COALESCE(finished_at, started_at, 0))
+        FROM jobs
+        WHERE last_error IS NOT NULL
+          AND kind IN ('memory_stage1', 'memory_consolidate_global')
+          AND (
+            lower(last_error) LIKE '%401%'
+            OR lower(last_error) LIKE '%unauthorized%'
+            OR lower(last_error) LIKE '%authentication%'
+            OR lower(last_error) LIKE '%missing bearer%'
+            OR lower(last_error) LIKE '%basic authentication%'
+            OR lower(last_error) LIKE '%invalid api key%'
+            OR lower(last_error) LIKE '%api key%'
+            OR lower(last_error) LIKE '%credential%'
+            OR lower(last_error) LIKE '%credentials%'
+            OR lower(last_error) LIKE '%bearer token%'
+          )
+        """
+    ).fetchone()
+    latest_auth_at = int(latest_auth_row[0] or 0) if latest_auth_row else 0
+    latest_success_at = 0
+    recovery_evidence = None
+    if latest_auth_at > 0:
+        if "stage1_outputs" in table_names(conn):
+            latest_success_row = conn.execute(
+                """
+                SELECT MAX(COALESCE(jobs.finished_at, jobs.started_at, 0))
+                FROM jobs
+                JOIN stage1_outputs ON stage1_outputs.thread_id = jobs.job_key
+                WHERE jobs.kind='memory_stage1'
+                  AND jobs.status='done'
+                  AND jobs.last_error IS NULL
+                  AND COALESCE(jobs.finished_at, jobs.started_at, 0) > ?
+                """,
+                (latest_auth_at,),
+            ).fetchone()
+            recovery_evidence = "stage1_done_with_output"
+        else:
+            latest_success_row = conn.execute(
+                """
+                SELECT MAX(COALESCE(finished_at, started_at, 0))
+                FROM jobs
+                WHERE kind='memory_stage1'
+                  AND status='done'
+                  AND last_error IS NULL
+                  AND COALESCE(finished_at, started_at, 0) > ?
+                """,
+                (latest_auth_at,),
+            ).fetchone()
+            recovery_evidence = "stage1_done_status"
+        latest_success_at = int(latest_success_row[0] or 0) if latest_success_row else 0
+    return {
+        "latest_auth_error_at": latest_auth_at,
+        "latest_successful_stage1_finished_at": latest_success_at,
+        "recovery_evidence": recovery_evidence,
+        "recovered": latest_success_at > latest_auth_at > 0,
+    }
+
+
+def memory_auth_recovered(conn: sqlite3.Connection) -> bool:
+    """Return true when DB evidence proves auth recovered after auth errors."""
+    return bool(memory_auth_recovery_report(conn)["recovered"])
 
 
 def memory_global_job_report(conn: sqlite3.Connection) -> JsonObject | None:

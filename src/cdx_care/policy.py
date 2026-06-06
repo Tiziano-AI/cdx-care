@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cdx_care.errors import CdxCareError
-from cdx_care.memory_reports import memory_error_category
+from cdx_care.memory_reports import memory_auth_recovery_report, memory_error_category
 from cdx_care.paths import StorePaths
 from cdx_care.policy_checks import (
     DEFAULT_STAGE1_RETRY_REMAINING,
@@ -292,7 +292,9 @@ def verify_lane_eligibility(row: sqlite3.Row, action: JsonObject, context: Apply
             or int(row["lease_until"] or 0) > context.now_seconds
         ):
             raise CdxCareError("memory Stage 1 job is not an exhausted idle error", code="row_not_eligible")
-        if memory_error_category(str(row["last_error"] or "")) == "auth":
+        if memory_error_category(str(row["last_error"] or "")) == "auth" and not action_declares_current_auth_recovery(
+            action, row
+        ):
             raise CdxCareError(
                 "memory Stage 1 auth errors require credential repair before retry",
                 code="row_not_eligible",
@@ -303,7 +305,9 @@ def verify_lane_eligibility(row: sqlite3.Row, action: JsonObject, context: Apply
             raise CdxCareError("memory global action must target the native global job", code="row_not_eligible")
         if int(row["lease_until"] or 0) > context.now_seconds:
             raise CdxCareError("memory global job has a future lease", code="row_not_eligible")
-        if memory_error_category(str(row["last_error"] or "")) == "auth":
+        if memory_error_category(str(row["last_error"] or "")) == "auth" and not action_declares_current_auth_recovery(
+            action, row
+        ):
             raise CdxCareError(
                 "memory global auth errors require credential repair before enqueue",
                 code="row_not_eligible",
@@ -325,6 +329,9 @@ def verify_memory_auth_blockers(conn: sqlite3.Connection, action: JsonObject) ->
     """Deny native memory worker mutations while current jobs show credential/auth failure."""
     if action.get("lane") not in {"memory.stage1_retry_terminal_errors", "memory.force_global_consolidation"}:
         return
+    live_recovery = memory_auth_recovery_report(conn)
+    if bool(live_recovery.get("recovered")) and action_recovery_matches(action, live_recovery):
+        return
     rows = conn.execute(
         """
         SELECT kind, job_key, last_error
@@ -340,6 +347,40 @@ def verify_memory_auth_blockers(conn: sqlite3.Connection, action: JsonObject) ->
                 "memory auth errors require credential repair before memory reconciliation",
                 code="row_not_eligible",
             )
+
+
+def action_recovery_matches(action: JsonObject, live_recovery: JsonObject) -> bool:
+    """Return whether a memory action carries the live planner auth-recovery proof."""
+    extra = action.get("extra")
+    if not isinstance(extra, dict):
+        return False
+    recovery = extra.get("auth_recovery")
+    if not isinstance(recovery, dict) or not bool(recovery.get("recovered")):
+        return False
+    return (
+        recovery.get("latest_auth_error_at") == live_recovery.get("latest_auth_error_at")
+        and recovery.get("latest_successful_stage1_finished_at")
+        == live_recovery.get("latest_successful_stage1_finished_at")
+        and recovery.get("recovery_evidence") == live_recovery.get("recovery_evidence")
+    )
+
+
+def action_declares_current_auth_recovery(action: JsonObject, row: sqlite3.Row) -> bool:
+    """Return whether action metadata proves recovery after this row's auth error."""
+    extra = action.get("extra")
+    if not isinstance(extra, dict):
+        return False
+    recovery = extra.get("auth_recovery")
+    if not isinstance(recovery, dict) or not bool(recovery.get("recovered")):
+        return False
+    latest_auth = recovery.get("latest_auth_error_at")
+    latest_success = recovery.get("latest_successful_stage1_finished_at")
+    row_error_at = int(row["finished_at"] or row["started_at"] or 0)
+    return (
+        isinstance(latest_auth, int)
+        and isinstance(latest_success, int)
+        and latest_success > latest_auth >= row_error_at
+    )
 
 
 def verify_mark_read_timestamp(

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from cdx_care_fixtures import (
     first_action,
+    insert_stage1_done,
     make_fixture,
     require_actions,
     set_global_consolidation_job,
@@ -50,6 +51,36 @@ class CdxCareMemoryAuthPolicyTest(unittest.TestCase):
             self.assertNotIn("memory-global-consolidation-enqueue", action_ids)
             denial_codes = {str(row.get("code")) for row in denials if isinstance(row, dict)}
             self.assertIn("memory.global_consolidation.auth_blocked", denial_codes)
+            self.assertNotIn("Missing bearer", str(plan))
+
+    def test_recovered_global_consolidation_auth_error_is_planned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            set_global_consolidation_job(
+                stores.db_path("memories"),
+                status="error",
+                worker_id=None,
+                ownership_token=None,
+                lease_until=None,
+                last_error="401 Unauthorized: Missing bearer token",
+                input_watermark=10,
+                last_success_watermark=10,
+            )
+            insert_stage1_done(stores.db_path("memories"), job_key="thread-memory-after-auth", finished_at=500)
+
+            plan = generate_plan(stores, "workstation")
+            action = first_action(plan, "memory-global-consolidation-enqueue")
+            denials = require_json_object_list(plan["denials"], "denials")
+            extra = action.get("extra")
+            if not isinstance(extra, dict):
+                raise AssertionError("action extra must be a dict")
+            recovery = extra.get("auth_recovery")
+            if not isinstance(recovery, dict):
+                raise AssertionError("auth_recovery must be a dict")
+
+            self.assertTrue(recovery.get("recovered"))
+            self.assertEqual("stage1_done_with_output", recovery.get("recovery_evidence"))
+            self.assertNotIn("memory.global_consolidation.auth_blocked", {str(row.get("code")) for row in denials})
             self.assertNotIn("Missing bearer", str(plan))
 
     def test_apply_denies_tampered_global_auth_enqueue_before_backup(self) -> None:
@@ -96,6 +127,33 @@ class CdxCareMemoryAuthPolicyTest(unittest.TestCase):
             self.assertIn("memory.stage1_retry.auth_blocked", {str(row.get("code")) for row in denials})
             self.assertNotIn("Missing bearer", str(plan))
 
+    def test_recovered_memory_auth_error_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            set_stage1_error(
+                stores.db_path("memories"),
+                job_key="thread-memory-error",
+                last_error="401 Unauthorized: Missing bearer or basic authentication in header",
+                retry_remaining=0,
+                finished_at=200,
+            )
+            insert_stage1_done(stores.db_path("memories"), job_key="thread-memory-after-auth", finished_at=300)
+
+            plan = generate_plan(stores, "workstation")
+            action = first_action(plan, "memory-stage1-retry:thread-memory-error")
+            denials = require_json_object_list(plan["denials"], "denials")
+            extra = action.get("extra")
+            if not isinstance(extra, dict):
+                raise AssertionError("action extra must be a dict")
+            recovery = extra.get("auth_recovery")
+            if not isinstance(recovery, dict):
+                raise AssertionError("auth_recovery must be a dict")
+
+            self.assertTrue(recovery.get("recovered"))
+            self.assertEqual("stage1_done_with_output", recovery.get("recovery_evidence"))
+            self.assertNotIn("memory.stage1_retry.auth_blocked", {str(row.get("code")) for row in denials})
+            self.assertNotIn("Missing bearer", str(plan))
+
     def test_apply_denies_tampered_auth_memory_retry_before_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stores = make_fixture(Path(tmp))
@@ -115,6 +173,68 @@ class CdxCareMemoryAuthPolicyTest(unittest.TestCase):
             for row in preconditions:
                 if isinstance(row, dict) and row.get("column") == "last_error":
                     row["sha256"] = value_hash(auth_error)
+            action["extra"] = {"auth_recovery": {"recovered": True}}
+            plan["planned_actions"] = [action]
+
+            with self.assertRaises(CdxCareError) as caught:
+                apply_plan(stores, plan)
+
+            self.assertEqual("row_not_eligible", caught.exception.code)
+            self.assertFalse((stores.care_root / "backups" / str(plan["run_id"])).exists())
+            self.assertFalse((stores.care_root / "receipts" / f"{plan['run_id']}.json").exists())
+
+    def test_apply_denies_recovered_auth_plan_when_new_auth_error_appears_before_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            auth_error = "401 Unauthorized: Missing bearer or basic authentication in header"
+            set_stage1_error(
+                stores.db_path("memories"),
+                job_key="thread-memory-error",
+                last_error=auth_error,
+                retry_remaining=0,
+                finished_at=200,
+            )
+            insert_stage1_done(stores.db_path("memories"), job_key="thread-memory-after-auth", finished_at=300)
+            plan = generate_plan(stores, "workstation")
+            action = first_action(plan, "memory-stage1-retry:thread-memory-error")
+
+            set_stage1_error(
+                stores.db_path("memories"),
+                job_key="thread-memory-retryable",
+                last_error=auth_error,
+                retry_remaining=0,
+                finished_at=400,
+            )
+            action["db_stat"] = stat_snapshot(stores.db_path("memories"))
+            plan["planned_actions"] = [action]
+
+            with self.assertRaises(CdxCareError) as caught:
+                apply_plan(stores, plan)
+
+            self.assertEqual("row_not_eligible", caught.exception.code)
+            self.assertFalse((stores.care_root / "backups" / str(plan["run_id"])).exists())
+            self.assertFalse((stores.care_root / "receipts" / f"{plan['run_id']}.json").exists())
+
+    def test_apply_denies_tampered_recovered_auth_metadata_before_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            set_stage1_error(
+                stores.db_path("memories"),
+                job_key="thread-memory-error",
+                last_error="401 Unauthorized: Missing bearer or basic authentication in header",
+                retry_remaining=0,
+                finished_at=200,
+            )
+            insert_stage1_done(stores.db_path("memories"), job_key="thread-memory-after-auth", finished_at=300)
+            plan = generate_plan(stores, "workstation")
+            action = first_action(plan, "memory-stage1-retry:thread-memory-error")
+            extra = action.get("extra")
+            if not isinstance(extra, dict):
+                raise AssertionError("action extra must be a dict")
+            recovery = extra.get("auth_recovery")
+            if not isinstance(recovery, dict):
+                raise AssertionError("auth_recovery must be a dict")
+            recovery["latest_successful_stage1_finished_at"] = 301
             plan["planned_actions"] = [action]
 
             with self.assertRaises(CdxCareError) as caught:
@@ -141,6 +261,36 @@ class CdxCareMemoryAuthPolicyTest(unittest.TestCase):
             self.assertIn("codex.memory.stage1_auth_errors", {str(row.get("code")) for row in findings})
             self.assertIn("'stage1_auth_error_count': 1", payload)
             self.assertIn("'error_category': 'auth'", payload)
+            self.assertNotIn("Missing bearer", payload)
+            self.assertNotIn("Unauthorized", payload)
+
+    def test_doctor_reports_recovered_auth_memory_errors_as_warning_without_raw_error_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = make_fixture(Path(tmp))
+            set_stage1_error(
+                stores.db_path("memories"),
+                job_key="thread-memory-error",
+                last_error="401 Unauthorized: Missing bearer or basic authentication in header",
+                retry_remaining=0,
+                finished_at=200,
+            )
+            insert_stage1_done(stores.db_path("memories"), job_key="thread-memory-after-auth", finished_at=300)
+
+            report = doctor_report(stores)
+            payload = str(report)
+            findings = require_json_object_list(report["findings"], "findings")
+            auth_findings = [
+                row for row in findings if row.get("code") == "codex.memory.stage1_auth_errors"
+            ]
+            if len(auth_findings) != 1:
+                raise AssertionError("expected one stage1 auth finding")
+            evidence = auth_findings[0].get("evidence")
+            if not isinstance(evidence, dict):
+                raise AssertionError("auth finding evidence must be a dict")
+
+            self.assertEqual("warn", auth_findings[0].get("severity"))
+            self.assertTrue(evidence.get("auth_recovered"))
+            self.assertIn("'recovery_evidence': 'stage1_done_with_output'", payload)
             self.assertNotIn("Missing bearer", payload)
             self.assertNotIn("Unauthorized", payload)
 

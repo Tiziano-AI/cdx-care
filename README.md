@@ -93,8 +93,10 @@ app badge.
   broken/non-navigable rows. The explicit `clear-current-badge` profile also
   marks current valid, navigable review rows read.
 - Memory: reset retryable terminal Stage 1 error jobs to claimable pending
-  state and enqueue the native global consolidation job. Auth/401 failures are
-  reported as credential/config blockers and are not blindly retried.
+  state and enqueue the native global consolidation job. Current Auth/401
+  failures remain credential/config blockers; historical Auth/401 rows are
+  admitted only when later successful Stage 1 output proves credentials
+  recovered, and apply rechecks that proof before backup/write.
 - `.DS_Store`: remove tracked Finder metadata from the memory git index and
   commit that exact untracking while keeping local ignored files.
 - Sessions/history: rebuild `session_index.jsonl` after rollout-file alignment

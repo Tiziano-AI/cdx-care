@@ -303,17 +303,45 @@ def set_global_consolidation_job(
         conn.commit()
 
 
-def set_stage1_error(db_path: Path, *, job_key: str, last_error: str, retry_remaining: int) -> None:
+def set_stage1_error(
+    db_path: Path,
+    *,
+    job_key: str,
+    last_error: str,
+    retry_remaining: int,
+    started_at: int = 100,
+    finished_at: int = 200,
+) -> None:
     """Set one Stage 1 job error for planner tests."""
     with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             UPDATE jobs
             SET status='error', last_error=?, retry_remaining=?, worker_id=NULL, ownership_token=NULL,
-                started_at=100, finished_at=200, lease_until=0, retry_at=NULL
+                started_at=?, finished_at=?, lease_until=0, retry_at=NULL
             WHERE kind='memory_stage1' AND job_key=?
             """,
-            (last_error, retry_remaining, job_key),
+            (last_error, retry_remaining, started_at, finished_at, job_key),
+        )
+        conn.commit()
+
+
+def insert_stage1_done(db_path: Path, *, job_key: str, finished_at: int) -> None:
+    """Insert a completed Stage 1 job with a matching output proof row."""
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs
+            VALUES ('memory_stage1', ?, 'done', NULL, NULL, ?, ?, NULL, NULL, 3, NULL, 0, 0)
+            """,
+            (job_key, finished_at - 10, finished_at),
+        )
+        conn.execute(
+            """
+            INSERT INTO stage1_outputs(thread_id, source_updated_at, selected_for_phase2)
+            VALUES (?, ?, 1)
+            """,
+            (job_key, finished_at),
         )
         conn.commit()
 

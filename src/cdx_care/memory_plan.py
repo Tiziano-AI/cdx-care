@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from cdx_care.memory_reports import memory_error_category
+from cdx_care.memory_reports import memory_auth_recovered, memory_auth_recovery_report, memory_error_category
 from cdx_care.paths import StorePaths
 from cdx_care.plan_actions import sqlite_insert_action, sqlite_update_action
 from cdx_care.policy_checks import DEFAULT_STAGE1_RETRY_REMAINING
@@ -29,7 +29,8 @@ def plan_memory_actions(stores: StorePaths, planned_at: str) -> tuple[list[JsonV
             return [], []
         fingerprint = schema_fingerprint(conn, [table for table in ("jobs", "stage1_outputs") if table in tables])
         memory_schema_tables = [table for table in ("jobs", "stage1_outputs") if table in tables]
-        auth_denials = plan_memory_auth_denials(conn)
+        auth_recovery = memory_auth_recovery_report(conn)
+        auth_denials = plan_memory_auth_denials(conn, recovered=bool(auth_recovery["recovered"]))
         if auth_denials:
             return [], auth_denials
         stage1_rows = conn.execute(
@@ -54,18 +55,9 @@ def plan_memory_actions(stores: StorePaths, planned_at: str) -> tuple[list[JsonV
             last_error = row["last_error"]
             error_category = memory_error_category(str(last_error or ""))
             if error_category == "auth":
-                denials.append(
-                    {
-                        "code": "memory.stage1_retry.auth_blocked",
-                        "job_key": str(row["job_key"]),
-                        "reason": (
-                            "Stage 1 memory job failed with an authentication error; repair Codex/OpenAI "
-                            "credential loading before retrying the native memory worker."
-                        ),
-                        "last_error_sha256": value_hash(last_error),
-                    }
-                )
-                continue
+                extra_recovery: dict[str, object] = {"auth_recovery": auth_recovery}
+            else:
+                extra_recovery = {}
             actions.append(
                 sqlite_update_action(
                     action_id=f"memory-stage1-retry:{row['job_key']}",
@@ -101,6 +93,7 @@ def plan_memory_actions(stores: StorePaths, planned_at: str) -> tuple[list[JsonV
                     extra={
                         "previous_error_category": memory_error_category(str(last_error or "")),
                         "previous_error_sha256": value_hash(last_error),
+                        **extra_recovery,
                     },
                 )
             )
@@ -115,8 +108,10 @@ def plan_memory_actions(stores: StorePaths, planned_at: str) -> tuple[list[JsonV
     return actions, denials
 
 
-def plan_memory_auth_denials(conn: sqlite3.Connection) -> list[JsonValue]:
+def plan_memory_auth_denials(conn: sqlite3.Connection, *, recovered: bool) -> list[JsonValue]:
     """Return sanitized memory auth blockers that should stop native worker retries."""
+    if recovered:
+        return []
     rows = conn.execute(
         """
         SELECT kind, job_key, status, retry_remaining, last_error
@@ -220,6 +215,7 @@ def plan_global_consolidation(
     current_input = int(current["input_watermark"] or 0)
     last_success = int(current["last_success_watermark"] or 0)
     lease_until = int(current["lease_until"] or 0)
+    recovered_auth = memory_auth_recovered(conn)
     if lease_until > now:
         return [], [
             {
@@ -271,7 +267,10 @@ def plan_global_consolidation(
             "input_watermark": target_watermark,
         },
         description="Enqueue the native global memory consolidation job.",
-        extra={"previous_error_sha256": value_hash(current["last_error"])},
+        extra={
+            "previous_error_sha256": value_hash(current["last_error"]),
+            **({"auth_recovery": memory_auth_recovery_report(conn)} if recovered_auth else {}),
+        },
     )
     action["schema_tables"] = schema_tables
     return [action], []
